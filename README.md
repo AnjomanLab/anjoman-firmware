@@ -1,12 +1,12 @@
-# Anjoman Firmware
+# Anjoman Firmware - Motion System Branch
 
-Firmware for the "Anjoman" project: A decentralized, leaderless formation control framework for differential drive robots without GPS.
+This branch (`feat/motion-system`) focuses on the low-level implementation of the motion system for the **Anjoman** robots.
 
-## Hardware Architecture
-- **MCU:** RP2040 (Motor control, Sensors) + ESP32-S3 (UWB, High-level logic)
-- **Sensors:** AS5600 (Encoders), VL53L7CX (ToF), DW1000 (UWB), BMI160 (IMU)
-- **Actuators:** DC Motors with DRV8833 Driver
+## Current Status
+This branch includes:
+*   **Motor Drivers:** H-Bridge control logic (DRV8833).
+*   **Odometry:** Absolute Magnetic Encoder drivers (AS5600 over I2C).
+*   **System Identification:** Calibration scripts in `examples/` to calculate motor transfer functions and gearbox ratio.
 
-## Dependencies
-- PlatformIO
-- Arduino Framework for RP2040
+## Next Steps
+This code will be merged into the `master` branch to serve as the foundation for the IMU and control logic implementation.
