@@ -9,4 +9,4 @@ This branch includes:
 *   **System Identification:** Calibration scripts in `examples/` to calculate motor transfer functions and gearbox ratio.
 
 ## Next Steps
-This code will be merged into the `master` branch to serve as the foundation for the IMU and control logic implementation.
+This code will be merged into the `main` branch to serve as the foundation for the IMU and control logic implementation.
