@@ -1,0 +1,9 @@
+{
+  "name": "Comms",
+  "version": "1.0.0",
+  "description": "ESP-NOW broadcast and decentralized multi-agent network module for Anjoman Swarm",
+  "keywords": "esp-now, comms, swarm, telemetry",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {}
+}
