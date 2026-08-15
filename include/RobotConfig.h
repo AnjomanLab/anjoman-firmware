@@ -49,6 +49,9 @@ namespace Config {
     const IPAddress GATEWAY(192, 168, 1, 1);
     const IPAddress SUBNET(255, 255, 255, 0);
 
+    // UWB Calibration Constants (Empirically Identified)
+    constexpr float UWB_CALIBRATION_OFFSET_M = 28.3833f;
+
     // Default Rates
     constexpr uint32_t TELEMETRY_RATE_HZ   = 20;
     constexpr uint32_t TELEMETRY_PERIOD_MS = 1000 / TELEMETRY_RATE_HZ;

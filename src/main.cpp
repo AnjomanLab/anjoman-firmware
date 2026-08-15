@@ -18,9 +18,52 @@ static uint32_t telemetrySeq = 0;
 
 volatile float latestDistanceM = 0.0f;
 volatile float latestRssi = 0.0f;
-volatile uint32_t pingPongCount = 0;
+volatile uint32_t successfulExchanges = 0;
 
-// High-speed, robust UWB Radio Profile
+constexpr double SPEED_OF_LIGHT = 299792458.0;
+constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103;
+
+// 1.5 ms Turnaround Delay in DW1000 timer ticks
+constexpr uint64_t SCHEDULED_REPLY_DELAY = 95846400ULL; 
+
+// Rolling Median Filter (Size 5)
+class MedianFilter5 {
+public:
+    MedianFilter5() : _idx(0), _filled(false) {
+        for (int i = 0; i < 5; i++) _buf[i] = 0.0f;
+    }
+
+    float update(float val) {
+        _buf[_idx] = val;
+        _idx = (_idx + 1) % 5;
+        if (_idx == 0) _filled = true;
+
+        uint8_t count = _filled ? 5 : _idx;
+        if (count == 0) return val;
+
+        float sorted[5];
+        for (uint8_t i = 0; i < count; i++) sorted[i] = _buf[i];
+
+        for (uint8_t i = 0; i < count - 1; i++) {
+            for (uint8_t j = 0; j < count - i - 1; j++) {
+                if (sorted[j] > sorted[j + 1]) {
+                    float tmp = sorted[j];
+                    sorted[j] = sorted[j + 1];
+                    sorted[j + 1] = tmp;
+                }
+            }
+        }
+        return sorted[count / 2];
+    }
+
+private:
+    float _buf[5];
+    uint8_t _idx;
+    bool _filled;
+};
+
+MedianFilter5 distanceFilter;
+
 device_configuration_t UWB_CONFIG = {
     false,
     true,
@@ -37,11 +80,28 @@ device_configuration_t UWB_CONFIG = {
 
 #pragma pack(push, 1)
 struct UWBPacket {
-    char header[4];          // "PING" or "PONG"
+    char header[4];          // "POLL" or "RESP"
     uint32_t sequence;
-    uint32_t replyDelayTicks;// Turnaround time on responder
+    uint8_t rxTimestamp[5];  // 40-bit hardware Rx timestamp
+    uint8_t txTimestamp[5];  // 40-bit hardware Tx timestamp
 };
 #pragma pack(pop)
+
+inline void write40BitTime(uint8_t *dest, uint64_t val) {
+    dest[0] = (uint8_t)(val & 0xFF);
+    dest[1] = (uint8_t)((val >> 8) & 0xFF);
+    dest[2] = (uint8_t)((val >> 16) & 0xFF);
+    dest[3] = (uint8_t)((val >> 24) & 0xFF);
+    dest[4] = (uint8_t)((val >> 32) & 0xFF);
+}
+
+inline uint64_t read40BitTime(const uint8_t *src) {
+    return ((uint64_t)src[0]) |
+           (((uint64_t)src[1]) << 8) |
+           (((uint64_t)src[2]) << 16) |
+           (((uint64_t)src[3]) << 24) |
+           (((uint64_t)src[4]) << 32);
+}
 
 void setupWiFi() {
     Serial.printf("[WiFi] Connecting to SSID: %s with Static IP: %s\n", 
@@ -68,12 +128,12 @@ void setupWiFi() {
         Serial.printf("[Netcat] Stream listening on port %d. Connect using: nc %s %d\n",
                       Config::NETCAT_PORT, WiFi.localIP().toString().c_str(), Config::NETCAT_PORT);
     } else {
-        Serial.println("\n[WiFi] Connection timed out. Operating in standalone mode.");
+        Serial.println("\n[WiFi] Operating in standalone mesh mode.");
     }
 }
 
 void setupUWB() {
-    Serial.println("\n[UWB] Initializing DW1000...");
+    Serial.println("\n[UWB] Initializing DW1000 on Dedicated SPI2 Bus...");
 
     pinMode(PIN_UWB_RST, OUTPUT);
     digitalWrite(PIN_UWB_RST, LOW);
@@ -93,9 +153,11 @@ void setupUWB() {
 
     char devId[128];
     DW1000Ng::getPrintableDeviceIdentifier(devId);
-    Serial.printf("[UWB] Ready: %s | Node ID: %d\n", devId, Config::ID);
+    Serial.printf("[UWB] Hardware Ready: %s | Node ID: %d\n", devId, Config::ID);
 
 #if ROBOT_ID == 2
+    DW1000Ng::clearReceiveStatus();
+    DW1000Ng::clearTransmitStatus();
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
 #endif
 }
@@ -109,59 +171,65 @@ void handlePeerTelemetry(const TelemetryPacket &pkt) {
     }
 }
 
-void uwbLoop() {
+void ssTwrLoop() {
 #if ROBOT_ID == 1
     // =========================================================================
-    // Robot 1: TWR Initiator
+    // Robot 1: SS-TWR Initiator (Sends POLL -> Awaits RESP)
     // =========================================================================
-    UWBPacket pingPkt;
-    memcpy(pingPkt.header, "PING", 4);
-    pingPkt.sequence = ++pingPongCount;
-    pingPkt.replyDelayTicks = 0;
+    UWBPacket pollPkt = {};
+    memcpy(pollPkt.header, "POLL", 4);
+    pollPkt.sequence = telemetrySeq;
 
     DW1000Ng::forceTRxOff();
-    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pingPkt), sizeof(pingPkt));
+    DW1000Ng::clearTransmitStatus();
+    DW1000Ng::clearReceiveStatus();
+
+    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
     DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
 
     while (!DW1000Ng::isTransmitDone()) { yield(); }
     DW1000Ng::clearTransmitStatus();
-    uint64_t txPollTime = DW1000Ng::getTransmitTimestamp();
+    uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
-    // Listen for PONG response
+    // Open receive window for response
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
 
     uint32_t startWait = millis();
-    bool gotPong = false;
+    bool gotResp = false;
 
     while (millis() - startWait < 30) {
         if (DW1000Ng::isReceiveDone()) {
             DW1000Ng::clearReceiveStatus();
 
-            size_t dataLen = DW1000Ng::getReceivedDataLength();
-            if (dataLen >= sizeof(UWBPacket)) {
-                UWBPacket pongPkt;
-                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pongPkt), sizeof(pongPkt));
+            size_t len = DW1000Ng::getReceivedDataLength();
+            if (len >= sizeof(UWBPacket)) {
+                UWBPacket respPkt;
+                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
 
-                if (memcmp(pongPkt.header, "PONG", 4) == 0) {
-                    uint64_t rxPongTime = DW1000Ng::getReceiveTimestamp();
+                if (memcmp(respPkt.header, "RESP", 4) == 0) {
+                    uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
                     latestRssi = (float)DW1000Ng::getReceivePower();
 
-                    // Calculate Time of Flight eliminating responder delay
-                    uint32_t roundTripTicks = (uint32_t)(rxPongTime - txPollTime);
-                    uint32_t replyTicks = pongPkt.replyDelayTicks;
+                    uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
+                    uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
 
-                    int32_t tofTicks = ((int32_t)roundTripTicks - (int32_t)replyTicks) / 2;
-                    
-                    if (tofTicks > 0) {
-                        double tofSec = (double)tofTicks * 0.000000000015650040064103;
-                        double dist = tofSec * 299792458.0;
+                    int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
+                    int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
 
-                        // Antenna delay offset correction
-                        dist = dist - 0.75; // Baseline antenna calibration offset
-                        if (dist < 0.05) dist = 0.05;
+                    int64_t tofTicks = (tRound - tReply) / 2;
 
-                        latestDistanceM = (float)dist;
-                        gotPong = true;
+                    if (tofTicks > 0 && tofTicks < 50000000ULL) {
+                        double rawDist = (double)tofTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+                        rawDist = DW1000NgRanging::correctRange((float)rawDist);
+
+                        // Subtract identified systematic antenna offset
+                        double calibratedDist = rawDist - Config::UWB_CALIBRATION_OFFSET_M;
+
+                        if (calibratedDist > 0.02 && calibratedDist < 30.0) {
+                            latestDistanceM = distanceFilter.update((float)calibratedDist);
+                            successfulExchanges++;
+                            gotResp = true;
+                        }
                     }
                 }
             }
@@ -170,53 +238,48 @@ void uwbLoop() {
         yield();
     }
 
-    if (!gotPong) {
-        DW1000Ng::forceTRxOff();
-    }
-
-    delay(60); // ~15 Hz
+    DW1000Ng::forceTRxOff();
+    DW1000Ng::clearReceiveStatus();
+    delay(50); // 20 Hz loop
 
 #elif ROBOT_ID == 2
     // =========================================================================
-    // Robot 2: TWR Responder
+    // Robot 2: SS-TWR Hardware-Scheduled Responder
     // =========================================================================
     if (DW1000Ng::isReceiveDone()) {
         DW1000Ng::clearReceiveStatus();
 
-        size_t dataLen = DW1000Ng::getReceivedDataLength();
-        if (dataLen >= sizeof(UWBPacket)) {
+        size_t len = DW1000Ng::getReceivedDataLength();
+        if (len >= sizeof(UWBPacket)) {
             UWBPacket recvPkt;
             DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&recvPkt), sizeof(recvPkt));
 
-            if (memcmp(recvPkt.header, "PING", 4) == 0) {
-                uint64_t rxPingTime = DW1000Ng::getReceiveTimestamp();
+            if (memcmp(recvPkt.header, "POLL", 4) == 0) {
+                uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
                 latestRssi = (float)DW1000Ng::getReceivePower();
-                pingPongCount++;
 
-                // Prepare PONG
-                UWBPacket pongPkt;
-                memcpy(pongPkt.header, "PONG", 4);
-                pongPkt.sequence = recvPkt.sequence;
+                uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) & 0xFFFFFFFE00ULL;
 
-                // Send immediate response
+                UWBPacket respPkt = {};
+                memcpy(respPkt.header, "RESP", 4);
+                respPkt.sequence = recvPkt.sequence;
+                write40BitTime(respPkt.rxTimestamp, tRx2);
+                write40BitTime(respPkt.txTimestamp, tTx2);
+
                 DW1000Ng::forceTRxOff();
-                DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pongPkt), sizeof(pongPkt));
-                DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
+                DW1000Ng::clearTransmitStatus();
+                DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
+                DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
+                DW1000Ng::startTransmit(TransmitMode::DELAYED);
 
                 while (!DW1000Ng::isTransmitDone()) { yield(); }
                 DW1000Ng::clearTransmitStatus();
-                uint64_t txPongTime = DW1000Ng::getTransmitTimestamp();
-
-                // Compute exact turnaround time on Robot 2
-                uint32_t replyDelay = (uint32_t)(txPongTime - rxPingTime);
-
-                // Re-embed delay for next frame or fast feedback
-                pongPkt.replyDelayTicks = replyDelay;
-                DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pongPkt), sizeof(pongPkt));
+                
+                successfulExchanges++;
             }
         }
 
-        // Return immediately to continuous listening
+        DW1000Ng::clearReceiveStatus();
         DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
     }
     yield();
@@ -225,12 +288,11 @@ void uwbLoop() {
 
 void commsTask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 20 Hz internal tick
+    const TickType_t xFrequency = pdMS_TO_TICKS(50);
 
     uint32_t lastNetcatLogMs = 0;
 
     while (true) {
-        // Accept incoming Netcat connection
         if (!netcatClient || !netcatClient.connected()) {
             netcatClient = netcatServer.accept();
         }
@@ -242,21 +304,22 @@ void commsTask(void *pvParameters) {
         packet.measuredDistanceM = latestDistanceM;
         packet.signalRssi = latestRssi;
 
-        // 1. Broadcast state over ESP-NOW to peer
+        // 1. Broadcast over ESP-NOW to peer
         comms.sendTelemetry(packet);
 
-        // 2. Stream to Netcat strictly once every 500ms (2 Hz)
+        // 2. Stream calibrated distance over Netcat (2 Hz)
         if (millis() - lastNetcatLogMs >= 500) {
             lastNetcatLogMs = millis();
 
             if (netcatClient && netcatClient.connected()) {
                 if (latestDistanceM > 0.0f) {
-                    netcatClient.printf("[R%d] Distance: %.2f m | RSSI: %.1f dBm | Exchanges: %u\n",
+                    netcatClient.printf("[R%d] Calibrated Distance: %.2f m (%.1f cm) | RSSI: %.1f dBm | Ex: %u\n",
                                         packet.senderId, packet.measuredDistanceM,
-                                        packet.signalRssi, pingPongCount);
+                                        packet.measuredDistanceM * 100.0f,
+                                        packet.signalRssi, successfulExchanges);
                 } else {
-                    netcatClient.printf("[R%d] UWB Ranging searching peer... (Packets: %u)\n",
-                                        packet.senderId, pingPongCount);
+                    netcatClient.printf("[R%d] UWB Ranging Initializing... (Exchanges: %u)\n",
+                                        packet.senderId, successfulExchanges);
                 }
             }
         }
@@ -270,7 +333,7 @@ void setup() {
     delay(1000);
 
     Serial.println("==================================================");
-    Serial.printf("        ANJOMAN FIRMWARE - REAL UWB RANGING (ROBOT %d)\n", Config::ID);
+    Serial.printf("        ANJOMAN FIRMWARE - CALIBRATED UWB (ROBOT %d)\n", Config::ID);
     Serial.println("==================================================");
 
     pinMode(PIN_STATUS_RGB, OUTPUT);
@@ -295,9 +358,9 @@ void setup() {
         0
     );
 
-    Serial.println("[System] Dynamic UWB Ranging Active.");
+    Serial.println("[System] Calibrated UWB Ranging Engine Ready.");
 }
 
 void loop() {
-    uwbLoop();
+    ssTwrLoop();
 }
