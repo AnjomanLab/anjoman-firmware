@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <WiFi.h>
 #include <SPI.h>
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
@@ -7,26 +6,20 @@
 #include "PinMap.h"
 #include "RobotConfig.h"
 #include "Types.h"
-#include "ESPNowBroadcast.h"
 
-WiFiServer netcatServer(Config::NETCAT_PORT);
-WiFiClient netcatClient;
-
-ESPNowBroadcast comms;
-TaskHandle_t commsTaskHandle = nullptr;
-static uint32_t telemetrySeq = 0;
-
-volatile float latestDistanceM = 0.0f;
-volatile float latestRssi = 0.0f;
-volatile uint32_t successfulExchanges = 0;
-
+// Fundamental Physical Constants
 constexpr double SPEED_OF_LIGHT = 299792458.0;
-constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103;
+constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103; // 15.65 ps per DW1000 tick
 
 // 1.5 ms Turnaround Delay in DW1000 timer ticks
 constexpr uint64_t SCHEDULED_REPLY_DELAY = 95846400ULL; 
 
-// Rolling Median Filter (Size 5)
+static uint32_t exchangeSequence = 0;
+volatile float latestCalibratedDistanceM = 0.0f;
+volatile float latestRssi = 0.0f;
+volatile uint32_t successfulExchanges = 0;
+
+// Rolling Median Filter (Size 5) for ultra-stable millimeter output
 class MedianFilter5 {
 public:
     MedianFilter5() : _idx(0), _filled(false) {
@@ -64,6 +57,7 @@ private:
 
 MedianFilter5 distanceFilter;
 
+// High-speed robust UWB Radio Profile
 device_configuration_t UWB_CONFIG = {
     false,
     true,
@@ -103,38 +97,7 @@ inline uint64_t read40BitTime(const uint8_t *src) {
            (((uint64_t)src[4]) << 32);
 }
 
-void setupWiFi() {
-    Serial.printf("[WiFi] Connecting to SSID: %s with Static IP: %s\n", 
-                  Config::WIFI_SSID, Config::STATIC_IP.toString().c_str());
-
-    WiFi.mode(WIFI_AP_STA);
-    if (!WiFi.config(Config::STATIC_IP, Config::GATEWAY, Config::SUBNET)) {
-        Serial.println("[WiFi] Static IP configuration failed!");
-    }
-
-    WiFi.begin(Config::WIFI_SSID, Config::WIFI_PASSWORD);
-
-    uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Connected! IP: %s | RSSI: %d dBm\n", 
-                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        netcatServer.begin();
-        Serial.printf("[Netcat] Stream listening on port %d. Connect using: nc %s %d\n",
-                      Config::NETCAT_PORT, WiFi.localIP().toString().c_str(), Config::NETCAT_PORT);
-    } else {
-        Serial.println("\n[WiFi] Operating in standalone mesh mode.");
-    }
-}
-
 void setupUWB() {
-    Serial.println("\n[UWB] Initializing DW1000 on Dedicated SPI2 Bus...");
-
     pinMode(PIN_UWB_RST, OUTPUT);
     digitalWrite(PIN_UWB_RST, LOW);
     delay(10);
@@ -151,10 +114,6 @@ void setupUWB() {
     DW1000Ng::setNetworkId(0xDECA);
     DW1000Ng::setAntennaDelay(16436);
 
-    char devId[128];
-    DW1000Ng::getPrintableDeviceIdentifier(devId);
-    Serial.printf("[UWB] Hardware Ready: %s | Node ID: %d\n", devId, Config::ID);
-
 #if ROBOT_ID == 2
     DW1000Ng::clearReceiveStatus();
     DW1000Ng::clearTransmitStatus();
@@ -162,23 +121,14 @@ void setupUWB() {
 #endif
 }
 
-void handlePeerTelemetry(const TelemetryPacket &pkt) {
-    if (pkt.senderId == Config::ID) return;
-
-    if (pkt.measuredDistanceM > 0.0f) {
-        latestDistanceM = pkt.measuredDistanceM;
-        latestRssi = pkt.signalRssi;
-    }
-}
-
-void ssTwrLoop() {
+void uwbRangingCycle() {
 #if ROBOT_ID == 1
     // =========================================================================
-    // Robot 1: SS-TWR Initiator (Sends POLL -> Awaits RESP)
+    // Robot 1: Precision Initiator (POLL -> Await RESP -> Full Calibration Model)
     // =========================================================================
     UWBPacket pollPkt = {};
     memcpy(pollPkt.header, "POLL", 4);
-    pollPkt.sequence = telemetrySeq;
+    pollPkt.sequence = ++exchangeSequence;
 
     DW1000Ng::forceTRxOff();
     DW1000Ng::clearTransmitStatus();
@@ -191,13 +141,13 @@ void ssTwrLoop() {
     DW1000Ng::clearTransmitStatus();
     uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
-    // Open receive window for response
+    // Open Receive Window for Response
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
 
     uint32_t startWait = millis();
     bool gotResp = false;
 
-    while (millis() - startWait < 30) {
+    while (millis() - startWait < 25) {
         if (DW1000Ng::isReceiveDone()) {
             DW1000Ng::clearReceiveStatus();
 
@@ -222,13 +172,28 @@ void ssTwrLoop() {
                         double rawDist = (double)tofTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
                         rawDist = DW1000NgRanging::correctRange((float)rawDist);
 
-                        // Subtract identified systematic antenna offset
-                        double calibratedDist = rawDist - Config::UWB_CALIBRATION_OFFSET_M;
+                        // 1. Invert Systematic Scale Factor & Hardware Offset
+                        double calibratedDist = (rawDist - Config::UWB_CALIBRATION_OFFSET_M) / Config::UWB_SCALE_FACTOR;
 
-                        if (calibratedDist > 0.02 && calibratedDist < 30.0) {
-                            latestDistanceM = distanceFilter.update((float)calibratedDist);
+                        // 2. Apply Piecewise RSSI Power Bias Compensation (Decawave APS011)
+                        if (latestRssi > -68.0f) {
+                            calibratedDist += 0.35f; // Near-field LNA saturation compensation
+                        } else if (latestRssi < -82.0f) {
+                            calibratedDist -= 0.10f; // Far-field attenuation compensation
+                        }
+
+                        // 3. Filter and Store Final Precision Distance
+                        if (calibratedDist > 0.05 && calibratedDist < 30.0) {
+                            latestCalibratedDistanceM = distanceFilter.update((float)calibratedDist);
                             successfulExchanges++;
                             gotResp = true;
+
+                            // Stream Live Calibrated Telemetry
+                            Serial.printf("[UWB] Calibrated Distance: %.2f m (%.1f cm) | RSSI: %.1f dBm | Ex: %u\n",
+                                          latestCalibratedDistanceM,
+                                          latestCalibratedDistanceM * 100.0f,
+                                          latestRssi,
+                                          successfulExchanges);
                         }
                     }
                 }
@@ -240,11 +205,11 @@ void ssTwrLoop() {
 
     DW1000Ng::forceTRxOff();
     DW1000Ng::clearReceiveStatus();
-    delay(50); // 20 Hz loop
+    delay(50); // 20 Hz loop rate
 
 #elif ROBOT_ID == 2
     // =========================================================================
-    // Robot 2: SS-TWR Hardware-Scheduled Responder
+    // Robot 2: Hardware-Scheduled Precision Responder
     // =========================================================================
     if (DW1000Ng::isReceiveDone()) {
         DW1000Ng::clearReceiveStatus();
@@ -256,7 +221,6 @@ void ssTwrLoop() {
 
             if (memcmp(recvPkt.header, "POLL", 4) == 0) {
                 uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
-                latestRssi = (float)DW1000Ng::getReceivePower();
 
                 uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) & 0xFFFFFFFE00ULL;
 
@@ -286,81 +250,23 @@ void ssTwrLoop() {
 #endif
 }
 
-void commsTask(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50);
-
-    uint32_t lastNetcatLogMs = 0;
-
-    while (true) {
-        if (!netcatClient || !netcatClient.connected()) {
-            netcatClient = netcatServer.accept();
-        }
-
-        TelemetryPacket packet = {};
-        packet.senderId = Config::ID;
-        packet.timestampMs = millis();
-        packet.sequenceId = telemetrySeq++;
-        packet.measuredDistanceM = latestDistanceM;
-        packet.signalRssi = latestRssi;
-
-        // 1. Broadcast over ESP-NOW to peer
-        comms.sendTelemetry(packet);
-
-        // 2. Stream calibrated distance over Netcat (2 Hz)
-        if (millis() - lastNetcatLogMs >= 500) {
-            lastNetcatLogMs = millis();
-
-            if (netcatClient && netcatClient.connected()) {
-                if (latestDistanceM > 0.0f) {
-                    netcatClient.printf("[R%d] Calibrated Distance: %.2f m (%.1f cm) | RSSI: %.1f dBm | Ex: %u\n",
-                                        packet.senderId, packet.measuredDistanceM,
-                                        packet.measuredDistanceM * 100.0f,
-                                        packet.signalRssi, successfulExchanges);
-                } else {
-                    netcatClient.printf("[R%d] UWB Ranging Initializing... (Exchanges: %u)\n",
-                                        packet.senderId, successfulExchanges);
-                }
-            }
-        }
-
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
-}
-
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(460800);
     delay(1000);
-
-    Serial.println("==================================================");
-    Serial.printf("        ANJOMAN FIRMWARE - CALIBRATED UWB (ROBOT %d)\n", Config::ID);
-    Serial.println("==================================================");
 
     pinMode(PIN_STATUS_RGB, OUTPUT);
     digitalWrite(PIN_STATUS_RGB, LOW);
 
-    setupWiFi();
-
-    if (!comms.begin(Config::ID)) {
-        Serial.println("[ERROR] ESP-NOW Init Failed!");
-    }
-    comms.registerTelemetryCallback(handlePeerTelemetry);
-
     setupUWB();
 
-    xTaskCreatePinnedToCore(
-        commsTask,
-        "CommsTask",
-        4096,
-        nullptr,
-        1,
-        &commsTaskHandle,
-        0
-    );
-
-    Serial.println("[System] Calibrated UWB Ranging Engine Ready.");
+#if ROBOT_ID == 1
+    Serial.println("==================================================");
+    Serial.println("   ANJOMAN SWARM - PRECISION CALIBRATED UWB RANGING");
+    Serial.printf("   Scale: %.6f | Offset: %.4f m\n", Config::UWB_SCALE_FACTOR, Config::UWB_CALIBRATION_OFFSET_M);
+    Serial.println("==================================================");
+#endif
 }
 
 void loop() {
-    ssTwrLoop();
+    uwbRangingCycle();
 }

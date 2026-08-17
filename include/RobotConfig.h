@@ -40,17 +40,9 @@ namespace Config {
     // Fleet Configuration
     constexpr uint8_t FLEET_SIZE         = 4;
 
-    // WiFi & Netcat Telemetry Configuration
-    constexpr const char* WIFI_SSID      = "Oochoo";
-    constexpr const char* WIFI_PASSWORD  = "ax200ax200";
-    constexpr uint16_t NETCAT_PORT       = 9000;
-
-    const IPAddress STATIC_IP(192, 168, 1, 150 + (ID - 1));
-    const IPAddress GATEWAY(192, 168, 1, 1);
-    const IPAddress SUBNET(255, 255, 255, 0);
-
-    // UWB Calibration Constants (Empirically Identified)
-    constexpr float UWB_CALIBRATION_OFFSET_M = 28.3833f;
+    // Empirically Identified UWB Calibration Parameters (1m to 7m Dataset)
+    constexpr float UWB_SCALE_FACTOR         = 1.162029f;
+    constexpr float UWB_CALIBRATION_OFFSET_M = 27.9014f;
 
     // Default Rates
     constexpr uint32_t TELEMETRY_RATE_HZ   = 20;
