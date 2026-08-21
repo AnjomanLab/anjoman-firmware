@@ -6,8 +6,6 @@
 
 <a name="english"></a>
 
-## English
-
 ### Overview
 
 **Anjoman** is an experimental firmware project for a decentralized swarm of autonomous differential-drive mobile robots.
@@ -121,8 +119,6 @@ The emphasis is on:
 
 <a name="فارسی"></a>
 
-## فارسی
-
 ### معرفی
 
 **انجمن** یک پروژه‌ی آزمایشی توسعه‌ی Firmware برای یک گروه از ربات‌های متحرک خودران با مکانیزم حرکتی Differential Drive است.
@@ -231,9 +227,3 @@ anjoman-firmware/
 * آزمایش‌های قابل تکرار
 * توسعه‌ی ماژولار
 * یکپارچه‌سازی ارتباط، تخمین، کنترل و ادراک
-
-```
-
-این نسخه عمداً **هیچ ادعایی مبنی بر تکمیل بودن EKF، Formation Control یا TDMA نمی‌کند** و وضعیت فعلی را از roadmap جدا نگه می‌دارد؛ برای README یک پروژه‌ی در حال توسعه، این تفکیک مهم است.
-```
-
