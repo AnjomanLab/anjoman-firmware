@@ -5,15 +5,57 @@
 #include <DW1000NgRanging.hpp>
 #include "PinMap.h"
 #include "RobotConfig.h"
+#include "Types.h"
 
 // Fundamental Physical Constants
 constexpr double SPEED_OF_LIGHT = 299792458.0;
-constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103; // 15.65 ps per tick
+constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103; // 15.65 ps per DW1000 tick
 
 // 1.5 ms Turnaround Delay in DW1000 timer ticks
 constexpr uint64_t SCHEDULED_REPLY_DELAY = 95846400ULL; 
 
 static uint32_t exchangeSequence = 0;
+volatile float latestCalibratedDistanceM = 0.0f;
+volatile float latestRssi = 0.0f;
+volatile uint32_t successfulExchanges = 0;
+
+// Rolling Median Filter (Size 5) for ultra-stable millimeter output
+class MedianFilter5 {
+public:
+    MedianFilter5() : _idx(0), _filled(false) {
+        for (int i = 0; i < 5; i++) _buf[i] = 0.0f;
+    }
+
+    float update(float val) {
+        _buf[_idx] = val;
+        _idx = (_idx + 1) % 5;
+        if (_idx == 0) _filled = true;
+
+        uint8_t count = _filled ? 5 : _idx;
+        if (count == 0) return val;
+
+        float sorted[5];
+        for (uint8_t i = 0; i < count; i++) sorted[i] = _buf[i];
+
+        for (uint8_t i = 0; i < count - 1; i++) {
+            for (uint8_t j = 0; j < count - i - 1; j++) {
+                if (sorted[j] > sorted[j + 1]) {
+                    float tmp = sorted[j];
+                    sorted[j] = sorted[j + 1];
+                    sorted[j + 1] = tmp;
+                }
+            }
+        }
+        return sorted[count / 2];
+    }
+
+private:
+    float _buf[5];
+    uint8_t _idx;
+    bool _filled;
+};
+
+MedianFilter5 distanceFilter;
 
 // High-speed robust UWB Radio Profile
 device_configuration_t UWB_CONFIG = {
@@ -31,18 +73,11 @@ device_configuration_t UWB_CONFIG = {
 };
 
 #pragma pack(push, 1)
-struct UWBPollPacket {
-    char header[4];          // "POLL"
+struct UWBPacket {
+    char header[4];          // "POLL" or "RESP"
     uint32_t sequence;
-};
-
-struct UWBResponsePacket {
-    char header[4];          // "RESP"
-    uint32_t sequence;
-    uint8_t rxTimestamp[5];  // tRx2 (40-bit)
-    uint8_t txTimestamp[5];  // tTx2 (40-bit)
-    float tempUwb2;          // DW1000 Thermal Model on Robot 2
-    float tempEsp2;          // ESP32 Core Temperature on Robot 2
+    uint8_t rxTimestamp[5];  // 40-bit hardware Rx timestamp
+    uint8_t txTimestamp[5];  // 40-bit hardware Tx timestamp
 };
 #pragma pack(pop)
 
@@ -60,12 +95,6 @@ inline uint64_t read40BitTime(const uint8_t *src) {
            (((uint64_t)src[2]) << 16) |
            (((uint64_t)src[3]) << 24) |
            (((uint64_t)src[4]) << 32);
-}
-
-// Safe, non-invasive thermal reading (coupled with PCB ground plane)
-float getSafeUwbTemp(float espTemp) {
-    // DW1000 operates at steady-state ~1.5°C lower than ESP32 core
-    return espTemp - 1.5f;
 }
 
 void setupUWB() {
@@ -95,9 +124,9 @@ void setupUWB() {
 void uwbRangingCycle() {
 #if ROBOT_ID == 1
     // =========================================================================
-    // Robot 1: Full Metrology Initiator
+    // Robot 1: Precision Initiator (POLL -> Await RESP -> Full Calibration Model)
     // =========================================================================
-    UWBPollPacket pollPkt = {};
+    UWBPacket pollPkt = {};
     memcpy(pollPkt.header, "POLL", 4);
     pollPkt.sequence = ++exchangeSequence;
 
@@ -108,8 +137,7 @@ void uwbRangingCycle() {
     DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
     DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
 
-    uint32_t txStart = millis();
-    while (!DW1000Ng::isTransmitDone() && (millis() - txStart < 10)) { yield(); }
+    while (!DW1000Ng::isTransmitDone()) { yield(); }
     DW1000Ng::clearTransmitStatus();
     uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
@@ -119,28 +147,19 @@ void uwbRangingCycle() {
     uint32_t startWait = millis();
     bool gotResp = false;
 
-    while (millis() - startWait < 30) {
+    while (millis() - startWait < 25) {
         if (DW1000Ng::isReceiveDone()) {
             DW1000Ng::clearReceiveStatus();
 
             size_t len = DW1000Ng::getReceivedDataLength();
-            if (len >= sizeof(UWBResponsePacket)) {
-                UWBResponsePacket respPkt;
+            if (len >= sizeof(UWBPacket)) {
+                UWBPacket respPkt;
                 DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
 
                 if (memcmp(respPkt.header, "RESP", 4) == 0) {
                     uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
-                    
-                    float rssi = (float)DW1000Ng::getReceivePower();
+                    latestRssi = (float)DW1000Ng::getReceivePower();
 
-                    // Read temperatures
-                    float temp_esp_1 = temperatureRead();
-                    float temp_uwb_1 = getSafeUwbTemp(temp_esp_1);
-
-                    float temp_esp_2 = respPkt.tempEsp2;
-                    float temp_uwb_2 = respPkt.tempUwb2;
-
-                    // 40-bit Hardware Timestamps
                     uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
                     uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
 
@@ -148,34 +167,35 @@ void uwbRangingCycle() {
                     int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
 
                     int64_t tofTicks = (tRound - tReply) / 2;
-                    
-                    // 1. Raw Uncalibrated Distance
-                    double range_raw_m = (double)tofTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
-                    range_raw_m = DW1000NgRanging::correctRange((float)range_raw_m);
 
-                    // 2. Calibrated Distance
-                    double range_calibrated_m = (range_raw_m - Config::UWB_CALIBRATION_OFFSET_M) / Config::UWB_SCALE_FACTOR;
-                    if (rssi > -68.0f) range_calibrated_m += 0.35f;
-                    else if (rssi < -82.0f) range_calibrated_m -= 0.10f;
+                    if (tofTicks > 0 && tofTicks < 50000000ULL) {
+                        double rawDist = (double)tofTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+                        rawDist = DW1000NgRanging::correctRange((float)rawDist);
 
-                    // Output Pure 13-Column CSV Row:
-                    // timestamp,sequence,range_raw_m,range_calibrated_m,rssi_dbm,tTx1,tRx1,tRx2,tTx2,temp_uwb_1,temp_uwb_2,temp_esp_1,temp_esp_2
-                    Serial.printf("%lu,%lu,%.4f,%.4f,%.2f,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f\n",
-                                  millis(),
-                                  (unsigned long)pollPkt.sequence,
-                                  range_raw_m,
-                                  range_calibrated_m,
-                                  rssi,
-                                  (unsigned long long)tTx1,
-                                  (unsigned long long)tRx1,
-                                  (unsigned long long)tRx2,
-                                  (unsigned long long)tTx2,
-                                  temp_uwb_1,
-                                  temp_uwb_2,
-                                  temp_esp_1,
-                                  temp_esp_2);
+                        // 1. Invert Systematic Scale Factor & Hardware Offset
+                        double calibratedDist = (rawDist - Config::UWB_CALIBRATION_OFFSET_M) / Config::UWB_SCALE_FACTOR;
 
-                    gotResp = true;
+                        // 2. Apply Piecewise RSSI Power Bias Compensation (Decawave APS011)
+                        if (latestRssi > -68.0f) {
+                            calibratedDist += 0.35f; // Near-field LNA saturation compensation
+                        } else if (latestRssi < -82.0f) {
+                            calibratedDist -= 0.10f; // Far-field attenuation compensation
+                        }
+
+                        // 3. Filter and Store Final Precision Distance
+                        if (calibratedDist > 0.05 && calibratedDist < 30.0) {
+                            latestCalibratedDistanceM = distanceFilter.update((float)calibratedDist);
+                            successfulExchanges++;
+                            gotResp = true;
+
+                            // Stream Live Calibrated Telemetry
+                            Serial.printf("[UWB] Calibrated Distance: %.2f m (%.1f cm) | RSSI: %.1f dBm | Ex: %u\n",
+                                          latestCalibratedDistanceM,
+                                          latestCalibratedDistanceM * 100.0f,
+                                          latestRssi,
+                                          successfulExchanges);
+                        }
+                    }
                 }
             }
             break;
@@ -185,34 +205,30 @@ void uwbRangingCycle() {
 
     DW1000Ng::forceTRxOff();
     DW1000Ng::clearReceiveStatus();
-    delay(50); // 20 Hz rate
+    delay(50); // 20 Hz loop rate
 
 #elif ROBOT_ID == 2
     // =========================================================================
-    // Robot 2: Hardware-Scheduled Responder with Remote Diagnostics
+    // Robot 2: Hardware-Scheduled Precision Responder
     // =========================================================================
     if (DW1000Ng::isReceiveDone()) {
         DW1000Ng::clearReceiveStatus();
 
         size_t len = DW1000Ng::getReceivedDataLength();
-        if (len >= sizeof(UWBPollPacket)) {
-            UWBPollPacket pollPkt;
-            DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
+        if (len >= sizeof(UWBPacket)) {
+            UWBPacket recvPkt;
+            DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&recvPkt), sizeof(recvPkt));
 
-            if (memcmp(pollPkt.header, "POLL", 4) == 0) {
+            if (memcmp(recvPkt.header, "POLL", 4) == 0) {
                 uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
 
                 uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) & 0xFFFFFFFE00ULL;
 
-                UWBResponsePacket respPkt = {};
+                UWBPacket respPkt = {};
                 memcpy(respPkt.header, "RESP", 4);
-                respPkt.sequence = pollPkt.sequence;
+                respPkt.sequence = recvPkt.sequence;
                 write40BitTime(respPkt.rxTimestamp, tRx2);
                 write40BitTime(respPkt.txTimestamp, tTx2);
-
-                // Sample local temperatures on Robot 2
-                respPkt.tempEsp2 = temperatureRead();
-                respPkt.tempUwb2 = getSafeUwbTemp(respPkt.tempEsp2);
 
                 DW1000Ng::forceTRxOff();
                 DW1000Ng::clearTransmitStatus();
@@ -220,9 +236,10 @@ void uwbRangingCycle() {
                 DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
                 DW1000Ng::startTransmit(TransmitMode::DELAYED);
 
-                uint32_t txStart = millis();
-                while (!DW1000Ng::isTransmitDone() && (millis() - txStart < 10)) { yield(); }
+                while (!DW1000Ng::isTransmitDone()) { yield(); }
                 DW1000Ng::clearTransmitStatus();
+                
+                successfulExchanges++;
             }
         }
 
@@ -243,8 +260,10 @@ void setup() {
     setupUWB();
 
 #if ROBOT_ID == 1
-    // Output Pure 13-Column CSV Header
-    Serial.println("timestamp,sequence,range_raw_m,range_calibrated_m,rssi_dbm,tTx1,tRx1,tRx2,tTx2,temp_uwb_1,temp_uwb_2,temp_esp_1,temp_esp_2");
+    Serial.println("==================================================");
+    Serial.println("   ANJOMAN SWARM - PRECISION CALIBRATED UWB RANGING");
+    Serial.printf("   Scale: %.6f | Offset: %.4f m\n", Config::UWB_SCALE_FACTOR, Config::UWB_CALIBRATION_OFFSET_M);
+    Serial.println("==================================================");
 #endif
 }
 
