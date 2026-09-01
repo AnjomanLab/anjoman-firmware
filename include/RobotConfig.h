@@ -10,45 +10,43 @@
 namespace Config {
 
 #if ROBOT_ID == 1
-    // Robot 1 Physical Configuration
     constexpr uint8_t ID = 1;
-    constexpr float GEAR_RATIO           = 48.0f;
-    constexpr float WHEEL_DIAMETER_M     = 0.0500f;
-    constexpr float WHEEL_RADIUS_M       = WHEEL_DIAMETER_M / 2.0f;
-    constexpr float TRACK_WIDTH_M        = 0.1350f;
-    
-    // IMU Offset from Axle Center [Lateral (Y), Longitudinal (X)] in meters
-    constexpr float IMU_OFFSET_LAT_M     = 0.0275f;
-    constexpr float IMU_OFFSET_LON_M     = 0.0300f;
-
+    constexpr float GEAR_RATIO       = 48.0f;
+    constexpr float WHEEL_DIAMETER_M = 0.0500f;
+    constexpr float TRACK_WIDTH_M    = 0.1350f;
 #elif ROBOT_ID == 2 || ROBOT_ID == 3 || ROBOT_ID == 4
-    // Robots 2, 3, 4 Physical Configuration
     constexpr uint8_t ID = ROBOT_ID;
-    constexpr float GEAR_RATIO           = 120.0f;
-    constexpr float WHEEL_DIAMETER_M     = 0.0550f;
-    constexpr float WHEEL_RADIUS_M       = WHEEL_DIAMETER_M / 2.0f;
-    constexpr float TRACK_WIDTH_M        = 0.1250f;
-    
-    // IMU Offset from Axle Center [Lateral (Y), Longitudinal (X)] in meters
-    constexpr float IMU_OFFSET_LAT_M     = 0.0000f;
-    constexpr float IMU_OFFSET_LON_M     = 0.0550f;
-
+    constexpr float GEAR_RATIO       = 120.0f;
+    constexpr float WHEEL_DIAMETER_M = 0.0550f;
+    constexpr float TRACK_WIDTH_M    = 0.1250f;
 #else
     #error "Invalid ROBOT_ID defined. Must be 1, 2, 3, or 4."
 #endif
 
-    // Fleet Configuration
-    constexpr uint8_t FLEET_SIZE         = 4;
+    // Fleet Networking Configuration
+    constexpr const char* WIFI_SSID      = "Oochoo";
+    constexpr const char* WIFI_PASSWORD  = "ax200ax200";
+    constexpr uint16_t NETCAT_PORT       = 9000;
+    const IPAddress STATIC_IP(192, 168, 1, 150 + (ID - 1));
+    const IPAddress GATEWAY(192, 168, 1, 1);
+    const IPAddress SUBNET(255, 255, 255, 0);
 
-    // Empirically Identified UWB Calibration Parameters (1m to 7m Dataset)
-    constexpr float UWB_SCALE_FACTOR         = 1.162029f;
-    constexpr float UWB_CALIBRATION_OFFSET_M = 27.9014f;
+    // ==============================================================================
+    // EXACT PAIRWISE CALIBRATION MATRIX (Empirically Identified from 60,400 samples)
+    // ==============================================================================
+    // Pairwise Hardware Offset Lookup Matrix (in Meters) for N=4 Swarm
+    constexpr float UWB_PAIR_OFFSETS[4][4] = {
+        //    R1           R2           R3           R4
+        {   0.0000f,   21.9198f,   23.1712f,   21.5458f }, // R1
+        {  21.9198f,    0.0000f,   31.4960f,   40.8656f }, // R2
+        {  23.1712f,   31.4960f,    0.0000f,   37.3417f }, // R3
+        {  21.5458f,   40.8656f,   37.3417f,    0.0000f }  // R4
+    };
 
-    // Default Rates
-    constexpr uint32_t TELEMETRY_RATE_HZ   = 20;
-    constexpr uint32_t TELEMETRY_PERIOD_MS = 1000 / TELEMETRY_RATE_HZ;
-
-    constexpr uint32_t CONTROL_RATE_HZ     = 100;
-    constexpr uint32_t CONTROL_PERIOD_MS   = 1000 / CONTROL_RATE_HZ;
+    // Helper to get calibrated distance between Robot i and Robot j
+    inline float getCalibratedDistance(uint8_t myId, uint8_t peerId, float rawDist) {
+        if (myId < 1 || myId > 4 || peerId < 1 || peerId > 4 || myId == peerId) return rawDist;
+        return rawDist - UWB_PAIR_OFFSETS[myId - 1][peerId - 1];
+    }
 
 } // namespace Config
