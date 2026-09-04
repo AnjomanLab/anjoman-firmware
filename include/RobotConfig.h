@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <IPAddress.h>
 
 #ifndef ROBOT_ID
     #define ROBOT_ID 1
@@ -9,44 +8,90 @@
 
 namespace Config {
 
+    // ==============================================================================
+    // 1. FLEET IDENTIFIED ACTUATOR & KINEMATICS PARAMETERS
+    // ==============================================================================
 #if ROBOT_ID == 1
     constexpr uint8_t ID = 1;
-    constexpr float GEAR_RATIO       = 48.0f;
-    constexpr float WHEEL_DIAMETER_M = 0.0500f;
-    constexpr float TRACK_WIDTH_M    = 0.1350f;
-#elif ROBOT_ID == 2 || ROBOT_ID == 3 || ROBOT_ID == 4
-    constexpr uint8_t ID = ROBOT_ID;
-    constexpr float GEAR_RATIO       = 120.0f;
-    constexpr float WHEEL_DIAMETER_M = 0.0550f;
-    constexpr float TRACK_WIDTH_M    = 0.1250f;
-#else
-    #error "Invalid ROBOT_ID defined. Must be 1, 2, 3, or 4."
+    constexpr float GEAR_RATIO           = 48.0f;
+    constexpr float WHEEL_DIAMETER_M     = 0.0500f;
+    constexpr float TRACK_WIDTH_M        = 0.1350f;
+
+    // Motor Inversion Polarities (Forward = Positive)
+    constexpr bool INVERT_MOTOR_LEFT     = false;
+    constexpr bool INVERT_MOTOR_RIGHT    = true;
+
+    // Identified Deadband Thresholds (PWM 0 to 1.0)
+    constexpr float DEADBAND_PWM_LEFT    = 0.60f;
+    constexpr float DEADBAND_PWM_RIGHT   = 0.60f;
+
+    // Actuator Gains & Time Constants
+    constexpr float MOTOR_GAIN_LEFT_RPM  = 596.7f;
+    constexpr float MOTOR_GAIN_RIGHT_RPM = 545.0f;
+    constexpr float MOTOR_TAU_LEFT_S     = 0.141f;
+    constexpr float MOTOR_TAU_RIGHT_S    = 0.133f;
+
+#elif ROBOT_ID == 2
+    constexpr uint8_t ID = 2;
+    constexpr float GEAR_RATIO           = 120.0f;
+    constexpr float WHEEL_DIAMETER_M     = 0.0550f;
+    constexpr float TRACK_WIDTH_M        = 0.1250f;
+
+    constexpr bool INVERT_MOTOR_LEFT     = true;
+    constexpr bool INVERT_MOTOR_RIGHT    = true;
+
+    constexpr float DEADBAND_PWM_LEFT    = 0.60f;
+    constexpr float DEADBAND_PWM_RIGHT   = 0.60f;
+
+    constexpr float MOTOR_GAIN_LEFT_RPM  = 164.8f;
+    constexpr float MOTOR_GAIN_RIGHT_RPM = 161.0f;
+    constexpr float MOTOR_TAU_LEFT_S     = 0.151f;
+    constexpr float MOTOR_TAU_RIGHT_S    = 0.172f;
+
+#elif ROBOT_ID == 3
+    constexpr uint8_t ID = 3;
+    constexpr float GEAR_RATIO           = 120.0f;
+    constexpr float WHEEL_DIAMETER_M     = 0.0550f;
+    constexpr float TRACK_WIDTH_M        = 0.1250f;
+
+    constexpr bool INVERT_MOTOR_LEFT     = false;
+    constexpr bool INVERT_MOTOR_RIGHT    = true;
+
+    constexpr float DEADBAND_PWM_LEFT    = 0.40f;
+    constexpr float DEADBAND_PWM_RIGHT   = 0.40f;
+
+    constexpr float MOTOR_GAIN_LEFT_RPM  = 120.4f;
+    constexpr float MOTOR_GAIN_RIGHT_RPM = 139.4f;
+    constexpr float MOTOR_TAU_LEFT_S     = 0.226f;
+    constexpr float MOTOR_TAU_RIGHT_S    = 0.163f;
+
+#elif ROBOT_ID == 4
+    constexpr uint8_t ID = 4;
+    constexpr float GEAR_RATIO           = 120.0f;
+    constexpr float WHEEL_DIAMETER_M     = 0.0550f;
+    constexpr float TRACK_WIDTH_M        = 0.1250f;
+
+    constexpr bool INVERT_MOTOR_LEFT     = true;
+    constexpr bool INVERT_MOTOR_RIGHT    = false;
+
+    constexpr float DEADBAND_PWM_LEFT    = 0.40f;
+    constexpr float DEADBAND_PWM_RIGHT   = 0.50f;
+
+    constexpr float MOTOR_GAIN_LEFT_RPM  = 144.5f;
+    constexpr float MOTOR_GAIN_RIGHT_RPM = 173.2f;
+    constexpr float MOTOR_TAU_LEFT_S     = 0.199f;
+    constexpr float MOTOR_TAU_RIGHT_S    = 0.165f;
 #endif
 
-    // Fleet Networking Configuration
-    constexpr const char* WIFI_SSID      = "Oochoo";
-    constexpr const char* WIFI_PASSWORD  = "ax200ax200";
-    constexpr uint16_t NETCAT_PORT       = 9000;
-    const IPAddress STATIC_IP(192, 168, 1, 150 + (ID - 1));
-    const IPAddress GATEWAY(192, 168, 1, 1);
-    const IPAddress SUBNET(255, 255, 255, 0);
+    // Universal Encoder Polarities (Mirror-Inversion Corrected)
+    constexpr bool INVERT_ENCODER_LEFT   = true;  // Universal on ALL robots
+    constexpr bool INVERT_ENCODER_RIGHT  = false; // Universal on ALL robots
 
-    // ==============================================================================
-    // EXACT PAIRWISE CALIBRATION MATRIX (Empirically Identified from 60,400 samples)
-    // ==============================================================================
-    // Pairwise Hardware Offset Lookup Matrix (in Meters) for N=4 Swarm
-    constexpr float UWB_PAIR_OFFSETS[4][4] = {
-        //    R1           R2           R3           R4
-        {   0.0000f,   21.9198f,   23.1712f,   21.5458f }, // R1
-        {  21.9198f,    0.0000f,   31.4960f,   40.8656f }, // R2
-        {  23.1712f,   31.4960f,    0.0000f,   37.3417f }, // R3
-        {  21.5458f,   40.8656f,   37.3417f,    0.0000f }  // R4
-    };
+    // Swarm-Wide Synchronous Cruising Velocity Ceiling (Governed by slowest robot)
+    constexpr float SWARM_MAX_CRUISE_VEL_M_S = 0.19f; // 19 cm/s (30% PID Headroom)
 
-    // Helper to get calibrated distance between Robot i and Robot j
-    inline float getCalibratedDistance(uint8_t myId, uint8_t peerId, float rawDist) {
-        if (myId < 1 || myId > 4 || peerId < 1 || peerId > 4 || myId == peerId) return rawDist;
-        return rawDist - UWB_PAIR_OFFSETS[myId - 1][peerId - 1];
-    }
+    constexpr float WHEEL_RADIUS_M       = WHEEL_DIAMETER_M / 2.0f;
+    constexpr uint32_t CONTROL_RATE_HZ   = 100;
+    constexpr uint32_t CONTROL_PERIOD_MS = 1000 / CONTROL_RATE_HZ;
 
 } // namespace Config
