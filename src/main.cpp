@@ -1,45 +1,104 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
 #include "PinMap.h"
 #include "RobotConfig.h"
 
 // ==============================================================================
-// 1. HARDWARE CONSTANTS
+// 1. HARDWARE CONSTANTS & POLARITY
 // ==============================================================================
-constexpr uint8_t TCA9548A_ADDR       = 0x70;
-constexpr uint8_t AS5600_ADDR         = 0x36;
-constexpr uint8_t AS5600_ANGLE_REG    = 0x0E;
-constexpr uint8_t BMI160_DEFAULT_ADDR = 0x69; // Or 0x68 depending on SDO pin
-constexpr uint32_t I2C_CLOCK_FREQ_HZ  = 400000;
-constexpr uint32_t PWM_FREQ_HZ        = 20000;  // 20 kHz ultrasonic PWM
-constexpr uint8_t  PWM_RES_BITS       = 10;     // 10-bit resolution (0 - 1023)
+constexpr float    VBAT_DIVIDER_RATIO  = 4.0000f;
+constexpr uint8_t  TCA9548A_ADDR       = 0x70;
+constexpr uint8_t  AS5600_ADDR         = 0x36;
+constexpr uint8_t  AS5600_ANGLE_REG    = 0x0E;
+constexpr uint32_t I2C_CLOCK_FREQ_HZ   = 400000;
+constexpr uint32_t PWM_FREQ_HZ         = 20000;
+constexpr uint8_t  PWM_RES_BITS        = 10;
+constexpr uint32_t STEP_DURATION_MS    = 1400; // 1.4s per step
 
-// Encoder State Tracking
-struct EncoderState {
-    int32_t cumulativeSteps = 0;
-    int16_t lastRawAngle = 0;
-    bool    isFirstRead = true;
+constexpr bool INVERT_ENC_LEFT  = true;
+constexpr bool INVERT_ENC_RIGHT = false;
+
+#if ROBOT_ID == 1
+    constexpr bool INVERT_MOTOR_L = false;
+    constexpr bool INVERT_MOTOR_R = true;
+#elif ROBOT_ID == 2
+    constexpr bool INVERT_MOTOR_L = true;
+    constexpr bool INVERT_MOTOR_R = true;
+#elif ROBOT_ID == 3
+    constexpr bool INVERT_MOTOR_L = false;
+    constexpr bool INVERT_MOTOR_R = true;
+#elif ROBOT_ID == 4
+    constexpr bool INVERT_MOTOR_L = true;
+    constexpr bool INVERT_MOTOR_R = false;
+#endif
+
+enum MotorMode : uint8_t {
+    MODE_BRAKE     = 0,
+    MODE_COAST     = 1,
+    MODE_DRIVE_FWD = 2,
+    MODE_DRIVE_REV = 3
 };
 
-EncoderState encL;
-EncoderState encR;
+struct EncoderChannel {
+    int32_t cumulativeSteps = 0;
+    int16_t lastRawAngle = 0;
+    int16_t lastDelta = 0;
+    uint16_t currentRawAngle = 0;
+    bool isFirstRead = true;
+};
 
-uint8_t detectedBMI160Addr = BMI160_DEFAULT_ADDR;
+EncoderChannel encL;
+EncoderChannel encR;
+
+// 11 Fine Steps: 0.40 to 0.70
+constexpr float fineSteps[11] = {
+    0.40f, 0.43f, 0.46f, 0.49f, 0.52f, 0.55f, 
+    0.58f, 0.61f, 0.64f, 0.67f, 0.70f
+};
+
+// 5 Synchronous Levels
+constexpr float syncLevels[5] = {0.43f, 0.49f, 0.55f, 0.61f, 0.67f};
+
+SPIClass SPI_SD(HSPI);
+File logFile;
+bool sdReady = false;
+
+#pragma pack(push, 1)
+struct TelemetryRecord {
+    uint64_t timeUs;
+    uint8_t  phase;
+    float    pwmL;
+    float    pwmR;
+    uint8_t  modeL;
+    uint8_t  modeR;
+    uint16_t rawAngL;
+    uint16_t rawAngR;
+    int16_t  deltaL;
+    int16_t  deltaR;
+    int32_t  stepsL;
+    int32_t  stepsR;
+    float    vbat;
+};
+#pragma pack(pop)
+
+QueueHandle_t sdQueue = nullptr;
+TaskHandle_t  core0LoggerHandle = nullptr;
 
 // ==============================================================================
-// 2. HARDWARE ABSTRACTION LAYER (HAL) FOR I2C SENSORS
+// 2. ENCODER HAL
 // ==============================================================================
 #if ROBOT_HAS_TCA9548A
-// --- Multiplexer Routing for Robots 1, 3, and 4 ---
-bool selectTCAChannel(uint8_t channel) {
-    if (channel > 7) return false;
+bool selectTCA(uint8_t ch) {
+    if (ch > 7) return false;
     Wire.beginTransmission(TCA9548A_ADDR);
-    Wire.write(1 << channel);
+    Wire.write(1 << ch);
     return (Wire.endTransmission() == 0);
 }
 
-uint16_t readAS5600RawAngle(uint8_t tcaChannel) {
-    if (!selectTCAChannel(tcaChannel)) return 0xFFFF;
+uint16_t readAS5600(uint8_t ch) {
+    if (!selectTCA(ch)) return 0xFFFF;
     Wire.beginTransmission(AS5600_ADDR);
     Wire.write(AS5600_ANGLE_REG);
     if (Wire.endTransmission() != 0) return 0xFFFF;
@@ -53,99 +112,38 @@ uint16_t readAS5600RawAngle(uint8_t tcaChannel) {
     return 0xFFFF;
 }
 
-void updateEncoders() {
-    // Read Left Encoder on TCA Channel 0
-    uint16_t rawL = readAS5600RawAngle(0);
+void pollEncoders() {
+    uint16_t rawL = readAS5600(0);
     if (rawL != 0xFFFF) {
-        int16_t currentRaw = (int16_t)rawL;
-        if (encL.isFirstRead) {
-            encL.lastRawAngle = currentRaw;
-            encL.isFirstRead = false;
-        } else {
-            int16_t delta = currentRaw - encL.lastRawAngle;
-            if (delta > 2048)  delta -= 4096;
-            if (delta < -2048) delta += 4096;
-            encL.cumulativeSteps += delta;
-            encL.lastRawAngle = currentRaw;
+        encL.currentRawAngle = rawL;
+        int16_t cur = (int16_t)rawL;
+        if (encL.isFirstRead) { encL.lastRawAngle = cur; encL.isFirstRead = false; }
+        else {
+            int16_t d = cur - encL.lastRawAngle;
+            if (d > 2048) d -= 4096;
+            if (d < -2048) d += 4096;
+            encL.lastDelta = -d;
+            encL.cumulativeSteps += encL.lastDelta;
+            encL.lastRawAngle = cur;
         }
     }
 
-    // Read Right Encoder on TCA Channel 1
-    uint16_t rawR = readAS5600RawAngle(1);
+    uint16_t rawR = readAS5600(1);
     if (rawR != 0xFFFF) {
-        int16_t currentRaw = (int16_t)rawR;
-        if (encR.isFirstRead) {
-            encR.lastRawAngle = currentRaw;
-            encR.isFirstRead = false;
-        } else {
-            int16_t delta = currentRaw - encR.lastRawAngle;
-            if (delta > 2048)  delta -= 4096;
-            if (delta < -2048) delta += 4096;
-            encR.cumulativeSteps += delta;
-            encR.lastRawAngle = currentRaw;
+        encR.currentRawAngle = rawR;
+        int16_t cur = (int16_t)rawR;
+        if (encR.isFirstRead) { encR.lastRawAngle = cur; encR.isFirstRead = false; }
+        else {
+            int16_t d = cur - encR.lastRawAngle;
+            if (d > 2048) d -= 4096;
+            if (d < -2048) d += 4096;
+            encR.lastDelta = d;
+            encR.cumulativeSteps += encR.lastDelta;
+            encR.lastRawAngle = cur;
         }
     }
 }
-
-bool initBMI160() {
-    if (!selectTCAChannel(2)) return false;
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x7E); Wire.write(0xB6); // Soft reset
-    Wire.endTransmission();
-    delay(50);
-
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x7E); Wire.write(0x11); // Accel normal mode
-    Wire.endTransmission();
-    delay(20);
-
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x7E); Wire.write(0x15); // Gyro normal mode
-    Wire.endTransmission();
-    delay(50);
-
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x43); Wire.write(0x00); // 2000 deg/s
-    Wire.endTransmission();
-
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x41); Wire.write(0x03); // 2g
-    Wire.endTransmission();
-    return true;
-}
-
-void readBMI160Data(float &gx, float &gy, float &gz, float &ax, float &ay, float &az) {
-    gx = gy = gz = ax = ay = az = 0.0f;
-    if (!selectTCAChannel(2)) return;
-
-    Wire.beginTransmission(BMI160_DEFAULT_ADDR);
-    Wire.write(0x0C);
-    if (Wire.endTransmission() != 0) return;
-
-    Wire.requestFrom((uint8_t)BMI160_DEFAULT_ADDR, (uint8_t)12);
-    if (Wire.available() >= 12) {
-        int16_t raw_gx = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_gy = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_gz = (int16_t)(Wire.read() | (Wire.read() << 8));
-
-        int16_t raw_ax = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_ay = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_az = (int16_t)(Wire.read() | (Wire.read() << 8));
-
-        constexpr float GYRO_SCALE  = 1.0f / 16.4f;
-        constexpr float ACCEL_SCALE = 9.80665f / 16384.0f;
-
-        gx = (float)raw_gx * GYRO_SCALE;
-        gy = (float)raw_gy * GYRO_SCALE;
-        gz = (float)raw_gz * GYRO_SCALE;
-        ax = (float)raw_ax * ACCEL_SCALE;
-        ay = (float)raw_ay * ACCEL_SCALE;
-        az = (float)raw_az * ACCEL_SCALE;
-    }
-}
-
 #else
-// --- Direct Dual-I2C Architecture for Robot 2 ---
 uint16_t readAS5600Direct(TwoWire &bus) {
     bus.beginTransmission(AS5600_ADDR);
     bus.write(AS5600_ANGLE_REG);
@@ -160,109 +158,41 @@ uint16_t readAS5600Direct(TwoWire &bus) {
     return 0xFFFF;
 }
 
-void updateEncoders() {
-    // Left Encoder on Primary I2C (Wire on GPIO 7, 8)
+void pollEncoders() {
     uint16_t rawL = readAS5600Direct(Wire);
     if (rawL != 0xFFFF) {
-        int16_t currentRaw = (int16_t)rawL;
-        if (encL.isFirstRead) {
-            encL.lastRawAngle = currentRaw;
-            encL.isFirstRead = false;
-        } else {
-            int16_t delta = currentRaw - encL.lastRawAngle;
-            if (delta > 2048)  delta -= 4096;
-            if (delta < -2048) delta += 4096;
-            encL.cumulativeSteps += delta;
-            encL.lastRawAngle = currentRaw;
+        encL.currentRawAngle = rawL;
+        int16_t cur = (int16_t)rawL;
+        if (encL.isFirstRead) { encL.lastRawAngle = cur; encL.isFirstRead = false; }
+        else {
+            int16_t d = cur - encL.lastRawAngle;
+            if (d > 2048) d -= 4096;
+            if (d < -2048) d += 4096;
+            encL.lastDelta = -d;
+            encL.cumulativeSteps += encL.lastDelta;
+            encL.lastRawAngle = cur;
         }
     }
 
-    // Right Encoder on Secondary I2C (Wire1 on GPIO 4, 6)
     uint16_t rawR = readAS5600Direct(Wire1);
     if (rawR != 0xFFFF) {
-        int16_t currentRaw = (int16_t)rawR;
-        if (encR.isFirstRead) {
-            encR.lastRawAngle = currentRaw;
-            encR.isFirstRead = false;
-        } else {
-            int16_t delta = currentRaw - encR.lastRawAngle;
-            if (delta > 2048)  delta -= 4096;
-            if (delta < -2048) delta += 4096;
-            encR.cumulativeSteps += delta;
-            encR.lastRawAngle = currentRaw;
+        encR.currentRawAngle = rawR;
+        int16_t cur = (int16_t)rawR;
+        if (encR.isFirstRead) { encR.lastRawAngle = cur; encR.isFirstRead = false; }
+        else {
+            int16_t d = cur - encR.lastRawAngle;
+            if (d > 2048) d -= 4096;
+            if (d < -2048) d += 4096;
+            encR.lastDelta = d;
+            encR.cumulativeSteps += encR.lastDelta;
+            encR.lastRawAngle = cur;
         }
-    }
-}
-
-bool initBMI160() {
-    // Detect Address on Primary I2C Bus
-    Wire.beginTransmission(0x69);
-    if (Wire.endTransmission() != 0) {
-        Wire.beginTransmission(0x68);
-        if (Wire.endTransmission() == 0) {
-            detectedBMI160Addr = 0x68;
-        } else {
-            return false;
-        }
-    }
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x7E); Wire.write(0xB6);
-    Wire.endTransmission();
-    delay(50);
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x7E); Wire.write(0x11);
-    Wire.endTransmission();
-    delay(20);
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x7E); Wire.write(0x15);
-    Wire.endTransmission();
-    delay(50);
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x43); Wire.write(0x00);
-    Wire.endTransmission();
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x41); Wire.write(0x03);
-    Wire.endTransmission();
-    return true;
-}
-
-void readBMI160Data(float &gx, float &gy, float &gz, float &ax, float &ay, float &az) {
-    gx = gy = gz = ax = ay = az = 0.0f;
-
-    Wire.beginTransmission(detectedBMI160Addr);
-    Wire.write(0x0C);
-    if (Wire.endTransmission() != 0) return;
-
-    Wire.requestFrom((uint8_t)detectedBMI160Addr, (uint8_t)12);
-    if (Wire.available() >= 12) {
-        int16_t raw_gx = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_gy = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_gz = (int16_t)(Wire.read() | (Wire.read() << 8));
-
-        int16_t raw_ax = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_ay = (int16_t)(Wire.read() | (Wire.read() << 8));
-        int16_t raw_az = (int16_t)(Wire.read() | (Wire.read() << 8));
-
-        constexpr float GYRO_SCALE  = 1.0f / 16.4f;
-        constexpr float ACCEL_SCALE = 9.80665f / 16384.0f;
-
-        gx = (float)raw_gx * GYRO_SCALE;
-        gy = (float)raw_gy * GYRO_SCALE;
-        gz = (float)raw_gz * GYRO_SCALE;
-        ax = (float)raw_ax * ACCEL_SCALE;
-        ay = (float)raw_ay * ACCEL_SCALE;
-        az = (float)raw_az * ACCEL_SCALE;
     }
 }
 #endif
 
 // ==============================================================================
-// 3. MOTOR DRIVER (DRV8833 DUAL H-BRIDGE PWM)
+// 3. MOTOR DRIVER
 // ==============================================================================
 void setupMotors() {
     pinMode(PIN_MOTOR_L_IN1, OUTPUT);
@@ -275,113 +205,81 @@ void setupMotors() {
     ledcAttach(PIN_MOTOR_R_IN1, PWM_FREQ_HZ, PWM_RES_BITS);
     ledcAttach(PIN_MOTOR_R_IN2, PWM_FREQ_HZ, PWM_RES_BITS);
 
-    // Initial Hard Brake
     ledcWrite(PIN_MOTOR_L_IN1, 1023);
     ledcWrite(PIN_MOTOR_L_IN2, 1023);
     ledcWrite(PIN_MOTOR_R_IN1, 1023);
     ledcWrite(PIN_MOTOR_R_IN2, 1023);
 }
 
-void setMotorSpeeds(float dutyL, float dutyR) {
-    dutyL = constrain(dutyL, -1.0f, 1.0f);
-    dutyR = constrain(dutyR, -1.0f, 1.0f);
+void commandMotor(uint8_t pin1, uint8_t pin2, float duty, bool invert, MotorMode &outMode) {
+    if (invert) duty = -duty;
+    duty = constrain(duty, -1.0f, 1.0f);
 
-    uint32_t valL = (uint32_t)(fabs(dutyL) * 1023.0f);
-    uint32_t valR = (uint32_t)(fabs(dutyR) * 1023.0f);
+    uint32_t val = (uint32_t)(fabs(duty) * 1023.0f);
 
-    // Left Motor Control
-    if (dutyL > 0.01f) {
-        ledcWrite(PIN_MOTOR_L_IN1, valL);
-        ledcWrite(PIN_MOTOR_L_IN2, 0);
-    } else if (dutyL < -0.01f) {
-        ledcWrite(PIN_MOTOR_L_IN1, 0);
-        ledcWrite(PIN_MOTOR_L_IN2, valL);
+    if (duty > 0.01f) {
+        ledcWrite(pin1, val);
+        ledcWrite(pin2, 0);
+        outMode = MODE_DRIVE_FWD;
+    } else if (duty < -0.01f) {
+        ledcWrite(pin1, 0);
+        ledcWrite(pin2, val);
+        outMode = MODE_DRIVE_REV;
     } else {
-        ledcWrite(PIN_MOTOR_L_IN1, 1023);
-        ledcWrite(PIN_MOTOR_L_IN2, 1023);
+        ledcWrite(pin1, 0);
+        ledcWrite(pin2, 0);
+        outMode = MODE_COAST;
     }
+}
 
-    // Right Motor Control
-    if (dutyR > 0.01f) {
-        ledcWrite(PIN_MOTOR_R_IN1, valR);
-        ledcWrite(PIN_MOTOR_R_IN2, 0);
-    } else if (dutyR < -0.01f) {
-        ledcWrite(PIN_MOTOR_R_IN1, 0);
-        ledcWrite(PIN_MOTOR_R_IN2, valR);
-    } else {
-        ledcWrite(PIN_MOTOR_R_IN1, 1023);
-        ledcWrite(PIN_MOTOR_R_IN2, 1023);
+void applyBrake() {
+    ledcWrite(PIN_MOTOR_L_IN1, 1023);
+    ledcWrite(PIN_MOTOR_L_IN2, 1023);
+    ledcWrite(PIN_MOTOR_R_IN1, 1023);
+    ledcWrite(PIN_MOTOR_R_IN2, 1023);
+}
+
+// ==============================================================================
+// 4. BATTERY VOLTAGE SAMPLER
+// ==============================================================================
+float readBatteryPack() {
+    uint32_t sumMv = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        sumMv += analogReadMilliVolts(PIN_VBAT_SENSE);
+    }
+    return (((float)sumMv / 4.0f) * 1e-3f) * VBAT_DIVIDER_RATIO;
+}
+
+// ==============================================================================
+// 5. CORE 0 ASYNCHRONOUS SD LOGGER TASK
+// ==============================================================================
+void core0LoggerTask(void *pvParameters) {
+    TelemetryRecord rec;
+    uint32_t writeCount = 0;
+
+    while (true) {
+        if (xQueueReceive(sdQueue, &rec, portMAX_DELAY) == pdTRUE) {
+            if (sdReady && logFile) {
+                logFile.printf("%llu,%u,%.3f,%.3f,%u,%u,%u,%u,%d,%d,%ld,%ld,%.3f\n",
+                               (unsigned long long)rec.timeUs, rec.phase,
+                               rec.pwmL, rec.pwmR, rec.modeL, rec.modeR,
+                               rec.rawAngL, rec.rawAngR, rec.deltaL, rec.deltaR,
+                               (long)rec.stepsL, (long)rec.stepsR, rec.vbat);
+                writeCount++;
+                if (writeCount % 50 == 0) logFile.flush();
+            }
+
+            Serial.printf("%llu,%u,%.3f,%.3f,%u,%u,%u,%u,%d,%d,%ld,%ld,%.2f\n",
+                          (unsigned long long)rec.timeUs, rec.phase,
+                          rec.pwmL, rec.pwmR, rec.modeL, rec.modeR,
+                          rec.rawAngL, rec.rawAngR, rec.deltaL, rec.deltaR,
+                          (long)rec.stepsL, (long)rec.stepsR, rec.vbat);
+        }
     }
 }
 
 // ==============================================================================
-// 4. AUTOMATED 60-SECOND BENCH TEST FSM SEQUENCE
-// ==============================================================================
-void runAutomatedBenchSequence(uint32_t elapsedMs, float &pwmL, float &pwmR, uint8_t &phase) {
-    // Phase 0: 0 to 5s - Static ZUPT (Rest)
-    if (elapsedMs < 5000) {
-        phase = 0;
-        pwmL = 0.0f;
-        pwmR = 0.0f;
-    }
-    // Phase 1: 5 to 15s - Left Motor Stiction Ramp (0% -> 50% PWM)
-    else if (elapsedMs < 15000) {
-        phase = 1;
-        float progress = (float)(elapsedMs - 5000) / 10000.0f;
-        pwmL = progress * 0.50f;
-        pwmR = 0.0f;
-    }
-    // Phase 2: 15 to 20s - Left Motor Speed Steps (30%, 60%, 100%)
-    else if (elapsedMs < 20000) {
-        phase = 2;
-        pwmR = 0.0f;
-        if (elapsedMs < 16500)      pwmL = 0.30f;
-        else if (elapsedMs < 18500) pwmL = 0.60f;
-        else                        pwmL = 1.00f;
-    }
-    // Phase 3: 20 to 25s - Left Motor Reverse Check (-40% PWM)
-    else if (elapsedMs < 25000) {
-        phase = 3;
-        pwmL = -0.40f;
-        pwmR = 0.0f;
-    }
-    // Phase 4: 25 to 35s - Right Motor Stiction Ramp (0% -> 50% PWM)
-    else if (elapsedMs < 35000) {
-        phase = 4;
-        pwmL = 0.0f;
-        float progress = (float)(elapsedMs - 25000) / 10000.0f;
-        pwmR = progress * 0.50f;
-    }
-    // Phase 5: 35 to 40s - Right Motor Speed Steps (30%, 60%, 100%)
-    else if (elapsedMs < 40000) {
-        phase = 5;
-        pwmL = 0.0f;
-        if (elapsedMs < 36500)      pwmR = 0.30f;
-        else if (elapsedMs < 38500) pwmR = 0.60f;
-        else                        pwmR = 1.00f;
-    }
-    // Phase 6: 40 to 45s - Right Motor Reverse Check (-40% PWM)
-    else if (elapsedMs < 45000) {
-        phase = 6;
-        pwmL = 0.0f;
-        pwmR = -0.40f;
-    }
-    // Phase 7: 45 to 55s - Dual Motor Forward Balance (50% PWM)
-    else if (elapsedMs < 55000) {
-        phase = 7;
-        pwmL = 0.50f;
-        pwmR = 0.50f;
-    }
-    // Phase 8: 55s to 60s+ - Full Brake & Test Complete
-    else {
-        phase = 8;
-        pwmL = 0.0f;
-        pwmR = 0.0f;
-    }
-}
-
-// ==============================================================================
-// 5. SETUP & 100 HZ REAL-TIME LOOP
+// 6. SETUP & REAL-TIME EXECUTION
 // ==============================================================================
 void setup() {
     Serial.begin(460800);
@@ -390,83 +288,141 @@ void setup() {
     pinMode(PIN_STATUS_RGB, OUTPUT);
     digitalWrite(PIN_STATUS_RGB, LOW);
 
+    analogSetAttenuation(ADC_11db);
+    pinMode(PIN_VBAT_SENSE, INPUT);
+
 #if ROBOT_HAS_TCA9548A
-    // Initialize Single I2C Bus on GPIO 1, 2 for Robots 1, 3, and 4
     Wire.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C_CLOCK_FREQ_HZ);
-    delay(20);
 #else
-    // Initialize Direct Dual I2C Buses for Robot 2
-    Wire.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C_CLOCK_FREQ_HZ);   // GPIO 7, 8
-    delay(20);
-    Wire1.begin(PIN_I2C1_SDA, PIN_I2C1_SCL, I2C_CLOCK_FREQ_HZ); // GPIO 4, 6
-    delay(20);
+    Wire.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C_CLOCK_FREQ_HZ);
+    Wire1.begin(PIN_I2C1_SDA, PIN_I2C1_SCL, I2C_CLOCK_FREQ_HZ);
 #endif
+    delay(20);
 
-    // Initialize BMI160
-    if (!initBMI160()) {
-        Serial.println("[WARN] BMI160 IMU initialization failed!");
-    }
-
-    // Initialize Motors
     setupMotors();
 
-    // Output Pure 13-Column CSV Header
-    Serial.println("TimeMs,Phase,PwmL,PwmR,RawEncL,RawEncR,GyroX,GyroY,GyroZ,AccelX,AccelY,AccelZ,TempESP");
+    // Init SPI3 MicroSD
+    SPI_SD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, -1);
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+    delay(50);
+
+    if (SD.begin(PIN_SD_CS, SPI_SD, 4000000)) {
+        sdReady = true;
+        char filename[32];
+        snprintf(filename, sizeof(filename), "/sysid_r%d.csv", Config::ID);
+        logFile = SD.open(filename, FILE_WRITE);
+        if (logFile) {
+            logFile.println("TimeUs,Phase,PwmCmdL,PwmCmdR,ModeL,ModeR,RawAngL,RawAngR,DeltaL,DeltaR,StepsL,StepsR,VbatV");
+            logFile.flush();
+        }
+    }
+
+    sdQueue = xQueueCreate(128, sizeof(TelemetryRecord));
+    xTaskCreatePinnedToCore(core0LoggerTask, "SDWorker", 4096, nullptr, 1, &core0LoggerHandle, 0);
+
+    Serial.printf("[INIT] Robot %d ready. SD: %s | ADC: GPIO %d\n", Config::ID, sdReady ? "OK" : "NO_SD", PIN_VBAT_SENSE);
+    Serial.println("TimeUs,Phase,PwmCmdL,PwmCmdR,ModeL,ModeR,RawAngL,RawAngR,DeltaL,DeltaR,StepsL,StepsR,VbatV");
+
+    // 5-second initial safety pause (allows placing robot on floor)
+    delay(5000);
 }
 
 void loop() {
-    static uint32_t startTestTimeMs = millis();
-    static bool testCompleted = false;
+    static uint32_t startTimeMs = millis();
+    static bool testDone = false;
 
-    if (testCompleted) {
+    if (testDone) {
+        applyBrake();
         vTaskDelay(pdMS_TO_TICKS(1000));
         return;
     }
 
     uint32_t nowMs = millis();
-    uint32_t elapsedMs = nowMs - startTestTimeMs;
+    uint32_t elapsedMs = nowMs - startTimeMs;
+    uint64_t nowUs = micros();
 
-    // 1. Read Encoders & IMU @ 100 Hz
-    updateEncoders();
+    pollEncoders();
+    float vbat = readBatteryPack();
 
-    float gx, gy, gz, ax, ay, az;
-    readBMI160Data(gx, gy, gz, ax, ay, az);
-    float tempESP = temperatureRead();
-
-    // 2. Execute Automated FSM Sequence
-    float pwmL = 0.0f;
-    float pwmR = 0.0f;
+    float cmdL = 0.0f;
+    float cmdR = 0.0f;
     uint8_t phase = 0;
-    runAutomatedBenchSequence(elapsedMs, pwmL, pwmR, phase);
 
-    // 3. Command Motor Outputs
-    setMotorSpeeds(pwmL, pwmR);
-
-    // 4. Stream Pure CSV Data Row (100 Hz)
-    Serial.printf("%lu,%u,%.3f,%.3f,%ld,%ld,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f\n",
-                  elapsedMs,
-                  phase,
-                  pwmL,
-                  pwmR,
-                  (long)encL.cumulativeSteps,
-                  (long)encR.cumulativeSteps,
-                  gx,
-                  gy,
-                  gz,
-                  ax,
-                  ay,
-                  az,
-                  tempESP);
-
-    // 5. Automatic Shutdown exactly at 60 Seconds
-    if (elapsedMs >= 60000) {
-        testCompleted = true;
-        setMotorSpeeds(0.0f, 0.0f); // Hard electrical brake
-
-        Serial.println("\n======================================================================");
-        Serial.printf("[BENCH-TEST COMPLETE] Automated 60s benchmark finished successfully (Robot %d).\n", Config::ID);
-        Serial.println("======================================================================");
+    // Automated 78-Second Sequence (0.40 to 0.70 PWM)
+    if (elapsedMs < 3000) {
+        // Phase 0: Standstill Baseline (3s)
+        phase = 0; cmdL = 0.0f; cmdR = 0.0f;
+    } else if (elapsedMs < 18400) {
+        // Phase 1: Left Fwd (11 steps x 1.4s = 15.4s)
+        phase = 1; cmdR = 0.0f;
+        uint32_t idx = (elapsedMs - 3000) / STEP_DURATION_MS;
+        cmdL = (idx < 11) ? fineSteps[idx] : fineSteps[10];
+    } else if (elapsedMs < 33800) {
+        // Phase 2: Left Rev (15.4s)
+        phase = 2; cmdR = 0.0f;
+        uint32_t idx = (elapsedMs - 18400) / STEP_DURATION_MS;
+        cmdL = (idx < 11) ? -fineSteps[idx] : -fineSteps[10];
+    } else if (elapsedMs < 49200) {
+        // Phase 3: Right Fwd (15.4s)
+        phase = 3; cmdL = 0.0f;
+        uint32_t idx = (elapsedMs - 33800) / STEP_DURATION_MS;
+        cmdR = (idx < 11) ? fineSteps[idx] : fineSteps[10];
+    } else if (elapsedMs < 64600) {
+        // Phase 4: Right Rev (15.4s)
+        phase = 4; cmdL = 0.0f;
+        uint32_t idx = (elapsedMs - 49200) / STEP_DURATION_MS;
+        cmdR = (idx < 11) ? -fineSteps[idx] : -fineSteps[10];
+    } else if (elapsedMs < 71600) {
+        // Phase 5: Both Fwd (5 steps x 1.4s = 7.0s) -> Straight Forward ~80cm
+        phase = 5;
+        uint32_t idx = (elapsedMs - 64600) / STEP_DURATION_MS;
+        float v = (idx < 5) ? syncLevels[idx] : syncLevels[4];
+        cmdL = v; cmdR = v;
+    } else if (elapsedMs < 78600) {
+        // Phase 6: Both Rev (5 steps x 1.4s = 7.0s) -> Return ~80cm
+        phase = 6;
+        uint32_t idx = (elapsedMs - 71600) / STEP_DURATION_MS;
+        float v = (idx < 5) ? -syncLevels[idx] : -syncLevels[4];
+        cmdL = v; cmdR = v;
+    } else {
+        // Test Complete: Hard Brake
+        phase = 7;
+        testDone = true;
+        applyBrake();
+        if (logFile) {
+            logFile.flush();
+            logFile.close();
+        }
+        Serial.printf("[COMPLETE] Robot %d test finished. File saved to SD.\n", Config::ID);
+        return;
     }
 
-    delay(10); // 100 Hz Loop Rate
+    // Command Motors
+    MotorMode modeL = MODE_BRAKE;
+    MotorMode modeR = MODE_BRAKE;
+    commandMotor(PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, cmdL, INVERT_MOTOR_L, modeL);
+    commandMotor(PIN_MOTOR_R_IN1, PIN_MOTOR_R_IN2, cmdR, INVERT_MOTOR_R, modeR);
+
+    // Push Record to Core 0 Queue
+    TelemetryRecord rec = {};
+    rec.timeUs = nowUs;
+    rec.phase = phase;
+    rec.pwmL = cmdL;
+    rec.pwmR = cmdR;
+    rec.modeL = (uint8_t)modeL;
+    rec.modeR = (uint8_t)modeR;
+    rec.rawAngL = encL.currentRawAngle;
+    rec.rawAngR = encR.currentRawAngle;
+    rec.deltaL = encL.lastDelta;
+    rec.deltaR = encR.lastDelta;
+    rec.stepsL = encL.cumulativeSteps;
+    rec.stepsR = encR.cumulativeSteps;
+    rec.vbat = vbat;
+
+    if (sdQueue != nullptr) {
+        xQueueSend(sdQueue, &rec, 0);
+    }
+
+    delay(10); // 100 Hz deterministic loop
 }
