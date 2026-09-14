@@ -145,4 +145,57 @@ namespace Config {
     const IPAddress GATEWAY(192, 168, 1, 1);
     const IPAddress SUBNET(255, 255, 255, 0);
 
+
+    // ==============================================================================
+// EMPIRICAL ACTUATOR IDENTIFICATION PARAMETERS (GROUND BENCHMARK)
+// ==============================================================================
+#if ROBOT_ID == 1
+    constexpr float DEADBAND_FWD_L = 0.4535f;
+    constexpr float DEADBAND_FWD_R = 0.4996f;
+    constexpr float DEADBAND_REV_L = 0.4658f;
+    constexpr float DEADBAND_REV_R = 0.4660f;
+    constexpr float GAIN_RPM_FWD_L = 196.93f;
+    constexpr float GAIN_RPM_FWD_R = 251.13f;
+    constexpr float GAIN_RPM_REV_L = 194.76f;
+    constexpr float GAIN_RPM_REV_R = 227.31f;
+    constexpr float ACTUATOR_TAU_S = 0.2130f;
+
+#elif ROBOT_ID == 2
+    constexpr float DEADBAND_FWD_L = 0.3719f;
+    constexpr float DEADBAND_FWD_R = 0.3828f;
+    constexpr float DEADBAND_REV_L = 0.4385f;
+    constexpr float DEADBAND_REV_R = 0.3681f;
+    constexpr float GAIN_RPM_FWD_L = 192.46f;
+    constexpr float GAIN_RPM_FWD_R = 194.96f;
+    constexpr float GAIN_RPM_REV_L = 229.81f;
+    constexpr float GAIN_RPM_REV_R = 186.07f;
+    constexpr float ACTUATOR_TAU_S = 0.1954f;
+
+#elif ROBOT_ID == 3
+    constexpr float DEADBAND_FWD_L = 0.4334f;
+    constexpr float DEADBAND_FWD_R = 0.3899f;
+    constexpr float DEADBAND_REV_L = 0.4316f;
+    constexpr float DEADBAND_REV_R = 0.4422f;
+    constexpr float GAIN_RPM_FWD_L = 213.21f;
+    constexpr float GAIN_RPM_FWD_R = 174.18f;
+    constexpr float GAIN_RPM_REV_L = 215.79f;
+    constexpr float GAIN_RPM_REV_R = 195.42f;
+    constexpr float ACTUATOR_TAU_S = 0.1967f;
+
+#elif ROBOT_ID == 4
+    constexpr float DEADBAND_FWD_L = 0.4284f;
+    constexpr float DEADBAND_FWD_R = 0.3960f;
+    constexpr float DEADBAND_REV_L = 0.4296f;
+    constexpr float DEADBAND_REV_R = 0.3923f;
+    constexpr float GAIN_RPM_FWD_L = 245.57f;
+    constexpr float GAIN_RPM_FWD_R = 222.02f;
+    constexpr float GAIN_RPM_REV_L = 243.65f;
+    constexpr float GAIN_RPM_REV_R = 213.26f;
+    constexpr float ACTUATOR_TAU_S = 0.2160f;
+#endif
+
+    // Swarm Kinematic Velocity Envelopes
+    constexpr float SWARM_CRUISE_VEL_M_S = 0.15f; // 15 cm/s
+    constexpr float SWARM_MAX_VEL_M_S    = 0.21f; // 21 cm/s
+
 } // namespace Config
