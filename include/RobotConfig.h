@@ -14,7 +14,7 @@ namespace Config {
     // ==============================================================================
     constexpr uint8_t FLEET_SIZE             = 4;
     constexpr float   GEAR_RATIO             = 120.0f;   // 1:120 homogeneous on all robots
-    constexpr float   WHEEL_DIAMETER_M       = 0.0500f;  // 50 mm diameter on all robots
+    constexpr float   WHEEL_DIAMETER_M       = 0.0537f;  // 50 mm diameter on all robots
     constexpr float   WHEEL_RADIUS_M         = WHEEL_DIAMETER_M / 2.0f; // 25 mm radius
     constexpr float   WHEEL_WIDTH_M          = 0.0280f;  // 28 mm wheel width
     constexpr float   ENCODER_CPR            = 4096.0f;  // 12-bit AS5600 resolution

@@ -73,8 +73,8 @@ bool MagneticEncoder::update(float dt) {
         // Raw RPM calculation: (delta / 4096) * (60 / dt)
         float instantRPM = ((float)delta / ENCODER_CPR) * (60.0f / dt);
         
-        // Discrete 1st-order low pass filter (alpha = 0.70) to attenuate quantization noise
-        _currentRPM = 0.70f * instantRPM + 0.30f * _currentRPM;
+        // Correct 1st-order LPF: alpha = 0.30, (1 - alpha) = 0.70
+        _currentRPM = 0.30f * instantRPM + 0.70f * _currentRPM;
         _currentRadPerSec = _currentRPM * (TWO_PI_F / 60.0f);
     }
 
