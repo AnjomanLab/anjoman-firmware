@@ -7,9 +7,10 @@
 #include "MagneticEncoder.h"
 #include "MotorController.h"
 #include "BMI160_Custom.h"
+#include "HeadingKalmanFilter.h"
 
 // ==============================================================================
-// 1. HARDWARE DEFINITIONS & 10-TURN BIDIRECTIONAL METROLOGY CONSTANTS
+// 1. HARDWARE & KINEMATIC CONSTANTS
 // ==============================================================================
 constexpr uint8_t  TCA9548A_ADDR       = 0x70;
 constexpr uint8_t  INA226_ADDR         = 0x40;
@@ -18,13 +19,15 @@ constexpr uint32_t CONTROL_RATE_HZ     = 100;
 constexpr uint32_t SAMPLE_PERIOD_US   = 1000000 / CONTROL_RATE_HZ; // 10 ms
 constexpr float    CONTROL_PERIOD_S    = 0.010f;
 
+// Calibrated Physical Constants
 constexpr float    R_EFF_M             = Config::WHEEL_RADIUS_M; // 0.02685 m
-constexpr float    W_NOM_M             = Config::TRACK_WIDTH_M;  // 0.1350m (R1) or 0.1250m (R2-R4)
+constexpr float    W_EFF_M             = Config::TRACK_WIDTH_M;  // Decoupled effective track width
 
-// 10 Full Turns (3600 deg = 20*PI rad) nominal wheel displacement and ticks:
-// S_wheel = 10 * PI * W_NOM_M
-constexpr int32_t  TARGET_10TURN_TICKS = (int32_t)((10.0f * PI * W_NOM_M) / (2.0f * PI * R_EFF_M) * Config::ENCODER_CPR);
-constexpr float    SPIN_CRUISE_RPM     = 35.0f; // Soft, stable angular rate (~90 deg/s body yaw)
+// 1.000m Straight Leg Target Ticks:
+constexpr int32_t  LEG_TARGET_TICKS    = (int32_t)((1.000f / (2.0f * PI * R_EFF_M)) * Config::ENCODER_CPR); // 24278 ticks
+constexpr float    CRUISE_SPEED_MPS    = 0.15f;
+constexpr float    CRUISE_RPM          = (CRUISE_SPEED_MPS / (2.0f * PI * R_EFF_M)) * 60.0f; // 53.30 RPM
+constexpr float    TURN_RPM            = 30.0f; // Stable 90-degree in-place turn speed
 
 constexpr float    SHUNT_RESISTOR_OHM  = Config::SHUNT_RESISTOR_OHM;
 
@@ -39,14 +42,22 @@ MagneticEncoder encR(Wire, TCA9548A_ADDR, 1, Config::INVERT_ENCODER_RIGHT);
 MotorController motorL(PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, Config::INVERT_MOTOR_LEFT);
 MotorController motorR(PIN_MOTOR_R_IN1, PIN_MOTOR_R_IN2, Config::INVERT_MOTOR_RIGHT);
 BMI160_Custom   imu(Wire, 0x69, 2);
+HeadingKalmanFilter kf;
+
+// 2D Dead Reckoning Position State
+float posX_m = 0.0f;
+float posY_m = 0.0f;
 
 #pragma pack(push, 1)
-struct BidirectionalSpinRecord {
+struct SquareBenchmarkRecord {
     uint64_t timestamp_us;
     uint32_t elapsed_ms;
-    uint8_t  phase;              // 0: ZUPT, 1: CCW (10-turn), 2: Pause, 3: CW (10-turn), 4: Done
-    float    target_rpm_l;
-    float    target_rpm_r;
+    uint8_t  state;              // 0: ZUPT, 1..4: Straight Legs, 11..14: 90-deg Turns, 99: Done
+    float    pos_x_m;
+    float    pos_y_m;
+    float    filtered_yaw_deg;
+    float    filtered_bias_dps;
+    float    raw_gyro_z_dps;
     float    meas_rpm_l;
     float    meas_rpm_r;
     float    pwm_duty_l;
@@ -55,11 +66,7 @@ struct BidirectionalSpinRecord {
     int32_t  steps_r;
     float    vbus_v;
     float    current_ma;
-    float    gyro_z_dps;
-    float    integrated_yaw_deg;
-    uint8_t  enc_l_valid;
-    uint8_t  enc_r_valid;
-    uint8_t  ina_valid;
+    uint8_t  slip_detected;
 };
 #pragma pack(pop)
 
@@ -113,23 +120,23 @@ bool readINA226(float &vbus_V, float &current_mA) {
 }
 
 void core0LoggerTask(void *pvParameters) {
-    BidirectionalSpinRecord rec;
+    SquareBenchmarkRecord rec;
     uint32_t recordsLogged = 0;
 
     while (true) {
         if (xQueueReceive(sdLogQueue, &rec, portMAX_DELAY) == pdTRUE) {
             if (sdCardReady && logFile) {
-                logFile.printf("%llu,%lu,%u,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%ld,%ld,%.2f,%.1f,%.3f,%.3f,%u,%u,%u\n",
+                logFile.printf("%llu,%lu,%u,%.4f,%.4f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f,%.3f,%ld,%ld,%.2f,%.1f,%u\n",
                                (unsigned long long)rec.timestamp_us,
                                (unsigned long)rec.elapsed_ms,
-                               rec.phase,
-                               rec.target_rpm_l, rec.target_rpm_r,
+                               rec.state,
+                               rec.pos_x_m, rec.pos_y_m,
+                               rec.filtered_yaw_deg, rec.filtered_bias_dps, rec.raw_gyro_z_dps,
                                rec.meas_rpm_l, rec.meas_rpm_r,
                                rec.pwm_duty_l, rec.pwm_duty_r,
                                (long)rec.steps_l, (long)rec.steps_r,
                                rec.vbus_v, rec.current_ma,
-                               rec.gyro_z_dps, rec.integrated_yaw_deg,
-                               rec.enc_l_valid, rec.enc_r_valid, rec.ina_valid);
+                               rec.slip_detected);
 
                 recordsLogged++;
                 if (recordsLogged % 50 == 0) {
@@ -176,6 +183,9 @@ void setup() {
     imu.begin();
     ina226Ready = initINA226();
 
+    // Initialize Heading Kalman Filter with identified covariances
+    kf.init(0.0f, Config::GYRO_BIAS_Z_RAD_S, Config::Q_YAW_DISCRETE, Config::Q_GYRO_BIAS_WALK, Config::R_YAW_ENCODER);
+
     SPI_SD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     pinMode(PIN_SD_CS, OUTPUT);
     digitalWrite(PIN_SD_CS, HIGH);
@@ -184,21 +194,22 @@ void setup() {
     if (SD.begin(PIN_SD_CS, SPI_SD, 10000000)) {
         sdCardReady = true;
         char filename[32];
-        snprintf(filename, sizeof(filename), "/spin_bi_10turn_r%d.csv", Config::ID);
+        snprintf(filename, sizeof(filename), "/square_1m_r%d.csv", Config::ID);
         logFile = SD.open(filename, FILE_WRITE);
         if (logFile) {
-            logFile.println("timestamp_us,elapsed_ms,phase,target_rpm_l,target_rpm_r,meas_rpm_l,meas_rpm_r,pwm_duty_l,pwm_duty_r,steps_l,steps_r,vbus_v,current_ma,gyro_z_dps,yaw_deg,enc_l_valid,enc_r_valid,ina_valid");
+            logFile.println("timestamp_us,elapsed_ms,state,pos_x_m,pos_y_m,yaw_deg,bias_dps,raw_gz_dps,rpm_l,rpm_r,pwm_l,pwm_r,steps_l,steps_r,vbus_v,current_ma,slip");
             logFile.flush();
         }
     }
 
-    sdLogQueue = xQueueCreate(256, sizeof(BidirectionalSpinRecord));
+    sdLogQueue = xQueueCreate(256, sizeof(SquareBenchmarkRecord));
     xTaskCreatePinnedToCore(core0LoggerTask, "SDLogger", 4096, nullptr, 1, &core0TaskHandle, 0);
 
     Serial.println("======================================================================");
-    Serial.printf("   ANJOMAN 10-TURN BIDIRECTIONAL SPIN (CCW + CW) BENCHMARK (ROBOT %d)\n", Config::ID);
-    Serial.printf("   Target: %d ticks/direction (3600 deg each) @ %.1f RPM\n", TARGET_10TURN_TICKS, SPIN_CRUISE_RPM);
-    Serial.printf("   MicroSD File: /spin_bi_10turn_r%d.csv | Status: %s\n", Config::ID, sdCardReady ? "READY" : "FAILED");
+    Serial.printf("   ANJOMAN 1x1 METER SQUARE MANEUVER BENCHMARK (ROBOT %d)\n", Config::ID);
+    Serial.printf("   Calibrated R_eff: %.4f m | Decoupled W_eff: %.4f m\n", R_EFF_M, W_EFF_M);
+    Serial.printf("   Target: 4 Legs of 1.000m (%d ticks) + 4 In-Place 90-deg CCW Turns\n", LEG_TARGET_TICKS);
+    Serial.printf("   MicroSD File: /square_1m_r%d.csv | Status: %s\n", Config::ID, sdCardReady ? "READY" : "FAILED");
     Serial.println("======================================================================");
 }
 
@@ -207,17 +218,24 @@ void loop() {
     static uint64_t nextSampleUs = micros();
     static bool testComplete = false;
 
-    // Phase: 0 = ZUPT (0-3s), 1 = CCW 10 Turns, 2 = Dwell Pause (3s), 3 = CW 10 Turns, 4 = Complete
-    static uint8_t testPhase = 0;
-    static uint32_t phaseStartTimeMs = 0;
+    // Maneuver State Machine:
+    // 0: ZUPT (3s)
+    // 1: Leg 1 (Straight +Y, 1m)   | 11: Turn 1 (Spin to 90 deg)
+    // 2: Leg 2 (Straight -X, 1m)   | 12: Turn 2 (Spin to 180 deg)
+    // 3: Leg 3 (Straight -Y, 1m)   | 13: Turn 3 (Spin to 270 deg)
+    // 4: Leg 4 (Straight +X, 1m)   | 14: Turn 4 (Spin to 360/0 deg)
+    // 99: Complete
+    static uint8_t  state = 0;
+    static uint32_t stateStartTimeMs = 0;
+    static int32_t  legStartStepsL = 0;
+    static int32_t  legStartStepsR = 0;
+    static float    targetHeadingDeg = 0.0f;
 
-    static int32_t baseStepsL = 0;
-    static int32_t baseStepsR = 0;
-
-    static float gyroBiasZ = Config::GYRO_BIAS_Z_DPS;
     static float gyroBiasSum = 0.0f;
-    static uint32_t biasSampleCount = 0;
-    static float integratedYawDeg = 0.0f;
+    static uint32_t zuptCount = 0;
+
+    static int32_t prevStepsL = 0;
+    static int32_t prevStepsR = 0;
 
     if (testComplete) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -230,138 +248,151 @@ void loop() {
     if (nowUs >= nextSampleUs) {
         nextSampleUs = nowUs + SAMPLE_PERIOD_US;
 
-        bool encLValid = encL.update(CONTROL_PERIOD_S);
-        bool encRValid = encR.update(CONTROL_PERIOD_S);
+        // 1. Hardware Sensing
+        encL.update(CONTROL_PERIOD_S);
+        encR.update(CONTROL_PERIOD_S);
 
         imu.readSensorData();
-        float gz_raw = imu.getGyroZ();
+        float gz_raw_dps = imu.getGyroZ();
+        float gz_raw_rad_s = gz_raw_dps * (PI / 180.0f);
 
         float vbus_V = 7.40f;
         float current_mA = 0.0f;
-        bool inaValid = readINA226(vbus_V, current_mA);
-        if (!inaValid || vbus_V < 6.0f) vbus_V = 7.40f;
+        readINA226(vbus_V, current_mA);
+        if (vbus_V < 6.0f) vbus_V = 7.40f;
 
         int32_t stepsL = encL.getCumulativeSteps();
         int32_t stepsR = encR.getCumulativeSteps();
+
+        int32_t dStepsL = stepsL - prevStepsL;
+        int32_t dStepsR = stepsR - prevStepsR;
+        prevStepsL = stepsL;
+        prevStepsR = stepsR;
+
+        float ds_l = ((float)dStepsL / Config::ENCODER_CPR) * (2.0f * PI * R_EFF_M);
+        float ds_r = ((float)dStepsR / Config::ENCODER_CPR) * (2.0f * PI * R_EFF_M);
+        float ds_mid = (ds_r + ds_l) * 0.5f;
+        float delta_theta_wheel = (ds_r - ds_l) / W_EFF_M;
+
+        // 2. Kalman Filter Heading Estimation (100 Hz)
+        kf.predict(gz_raw_rad_s, CONTROL_PERIOD_S);
+        bool slip = !kf.updateEncoder(delta_theta_wheel, gz_raw_rad_s, CONTROL_PERIOD_S);
+
+        float currentHeadingRad = kf.getHeadingRad();
+        float currentHeadingDeg = kf.getHeadingDeg();
+
+        // 3. Cartesian Dead Reckoning Position Update (Forward = +Y, Right = +X, Left = -X)
+        // With standard CCW rotation (+theta turns left towards -X):
+        posX_m += ds_mid * (-sinf(currentHeadingRad));
+        posY_m += ds_mid * cosf(currentHeadingRad);
 
         float targetRpmL = 0.0f;
         float targetRpmR = 0.0f;
         float dutyL = 0.0f;
         float dutyR = 0.0f;
 
-        // Phase 0: Stationary Pre-Spin ZUPT (0 to 3000 ms)
-        if (testPhase == 0) {
+        // 4. Square Maneuver State Machine
+        if (state == 0) {
+            // ZUPT: Pre-mission static calibration (0 to 3000 ms)
             motorL.brake();
             motorR.brake();
-
-            gyroBiasSum += gz_raw;
-            biasSampleCount++;
+            gyroBiasSum += gz_raw_rad_s;
+            zuptCount++;
 
             if (elapsedMs >= 3000) {
-                if (biasSampleCount > 100) {
-                    float measuredBias = gyroBiasSum / (float)biasSampleCount;
-                    if (fabs(measuredBias - Config::GYRO_BIAS_Z_DPS) < 0.35f) {
-                        gyroBiasZ = measuredBias;
+                if (zuptCount > 100) {
+                    float measuredBias = gyroBiasSum / (float)zuptCount;
+                    kf.init(0.0f, measuredBias, Config::Q_YAW_DISCRETE, Config::Q_GYRO_BIAS_WALK, Config::R_YAW_ENCODER);
+                }
+                state = 1; // Transition to Leg 1
+                stateStartTimeMs = millis();
+                legStartStepsL = stepsL;
+                legStartStepsR = stepsR;
+                rgbLedWrite(PIN_STATUS_RGB, 0, 0, 50); // Blue (Driving Straight)
+            }
+        }
+        // Straight Driving Legs (1, 2, 3, 4)
+        else if (state >= 1 && state <= 4) {
+            targetRpmL = CRUISE_RPM;
+            targetRpmR = CRUISE_RPM;
+
+            int32_t legStepsL = stepsL - legStartStepsL;
+            int32_t legStepsR = stepsR - legStartStepsR;
+            int32_t avgLegTicks = (legStepsL + legStepsR) / 2;
+
+            // Cross-Coupled Tick Sync to maintain strict straightness
+            int32_t tickError = legStepsL - legStepsR;
+            float syncCorrection = constrain((float)tickError * 0.00015f, -0.08f, 0.08f);
+
+            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
+            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, +syncCorrection);
+
+            // Transition: Exactly 1.000m reached
+            if (avgLegTicks >= LEG_TARGET_TICKS || (millis() - stateStartTimeMs) >= 12000) {
+                state += 10; // State 1 -> 11, 2 -> 12, etc.
+                targetHeadingDeg += 90.0f; // Target next corner
+                stateStartTimeMs = millis();
+                motorL.brake();
+                motorR.brake();
+                rgbLedWrite(PIN_STATUS_RGB, 40, 0, 40); // Magenta (In-Place Turn)
+            }
+        }
+        // In-Place 90-Degree Closed-Loop Turns (11, 12, 13, 14)
+        else if (state >= 11 && state <= 14) {
+            // Turn CCW (+yaw)
+            targetRpmL = -TURN_RPM;
+            targetRpmR = +TURN_RPM;
+
+            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, 0.0f);
+            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, 0.0f);
+
+            // Threshold: Stop precisely when Kalman Filter Heading reaches target
+            if (currentHeadingDeg >= (targetHeadingDeg - 1.0f) || (millis() - stateStartTimeMs) >= 8000) {
+                motorL.brake();
+                motorR.brake();
+
+                if (state == 14) {
+                    // All 4 legs and 4 turns complete!
+                    state = 99;
+                    testComplete = true;
+
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    if (logFile) {
+                        logFile.flush();
+                        logFile.close();
                     }
+
+                    rgbLedWrite(PIN_STATUS_RGB, 0, 60, 0); // Solid Green (Mission Complete)
+
+                    Serial.println("\n======================================================================");
+                    Serial.printf("[MISSION COMPLETE] 1x1m Square Finished for Robot %d\n", Config::ID);
+                    Serial.printf("   Calculated Final Position: X = %.4f m, Y = %.4f m\n", posX_m, posY_m);
+                    Serial.printf("   Filtered Final Yaw: %.2f deg (Nominal: 360.00 deg)\n", currentHeadingDeg);
+                    Serial.printf("   Estimated Final Gyro Bias: %.4f deg/s\n", kf.getBiasDegS());
+                    Serial.printf("   Return-to-Origin Distance Error: %.1f mm\n", sqrtf(posX_m*posX_m + posY_m*posY_m) * 1000.0f);
+                    Serial.println("   --> Measure actual physical position from the start line on the floor!");
+                    Serial.println("======================================================================");
+                } else {
+                    // Transition to next straight leg
+                    state = (state - 10) + 1;
+                    stateStartTimeMs = millis();
+                    legStartStepsL = stepsL;
+                    legStartStepsR = stepsR;
+                    rgbLedWrite(PIN_STATUS_RGB, 0, 0, 50); // Blue
                 }
-                testPhase = 1;
-                phaseStartTimeMs = millis();
-                baseStepsL = stepsL;
-                baseStepsR = stepsR;
-                rgbLedWrite(PIN_STATUS_RGB, 0, 0, 50); // Blue (CCW)
-            }
-        }
-        // Phase 1: 10 Full Turns CCW (Left REV, Right FWD)
-        else if (testPhase == 1) {
-            targetRpmL = -SPIN_CRUISE_RPM;
-            targetRpmR = +SPIN_CRUISE_RPM;
-
-            int32_t dStepsL = stepsL - baseStepsL;
-            int32_t dStepsR = stepsR - baseStepsR;
-            int32_t avgSpinTicks = (abs(dStepsL) + abs(dStepsR)) / 2;
-
-            // Tick sync balance for CCW: dStepsR + dStepsL == 0
-            int32_t syncError = dStepsR + dStepsL;
-            float syncCorrection = constrain((float)syncError * 0.00015f, -0.08f, 0.08f);
-
-            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
-            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
-
-            float correctedGz = gz_raw - gyroBiasZ;
-            integratedYawDeg += correctedGz * CONTROL_PERIOD_S;
-
-            if (avgSpinTicks >= TARGET_10TURN_TICKS || (millis() - phaseStartTimeMs) >= 55000) {
-                testPhase = 2;
-                phaseStartTimeMs = millis();
-                motorL.brake();
-                motorR.brake();
-                rgbLedWrite(PIN_STATUS_RGB, 30, 20, 0); // Yellow (Pause)
-            }
-        }
-        // Phase 2: Dwell Pause (3 seconds)
-        else if (testPhase == 2) {
-            motorL.brake();
-            motorR.brake();
-
-            float correctedGz = gz_raw - gyroBiasZ;
-            integratedYawDeg += correctedGz * CONTROL_PERIOD_S;
-
-            if ((millis() - phaseStartTimeMs) >= 3000) {
-                testPhase = 3;
-                phaseStartTimeMs = millis();
-                baseStepsL = stepsL;
-                baseStepsR = stepsR;
-                rgbLedWrite(PIN_STATUS_RGB, 50, 0, 50); // Purple (CW)
-            }
-        }
-        // Phase 3: 10 Full Turns CW (Left FWD, Right REV)
-        else if (testPhase == 3) {
-            targetRpmL = +SPIN_CRUISE_RPM;
-            targetRpmR = -SPIN_CRUISE_RPM;
-
-            int32_t dStepsL = stepsL - baseStepsL;
-            int32_t dStepsR = stepsR - baseStepsR;
-            int32_t avgSpinTicks = (abs(dStepsL) + abs(dStepsR)) / 2;
-
-            // Tick sync balance for CW: dStepsL + dStepsR == 0
-            int32_t syncError = dStepsL + dStepsR;
-            float syncCorrection = constrain((float)syncError * 0.00015f, -0.08f, 0.08f);
-
-            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
-            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
-
-            float correctedGz = gz_raw - gyroBiasZ;
-            integratedYawDeg += correctedGz * CONTROL_PERIOD_S;
-
-            if (avgSpinTicks >= TARGET_10TURN_TICKS || (millis() - phaseStartTimeMs) >= 55000) {
-                testPhase = 4;
-                testComplete = true;
-
-                motorL.brake();
-                motorR.brake();
-
-                vTaskDelay(pdMS_TO_TICKS(150));
-                if (logFile) {
-                    logFile.flush();
-                    logFile.close();
-                }
-
-                rgbLedWrite(PIN_STATUS_RGB, 0, 60, 0); // Solid Green (Done)
-
-                Serial.println("\n======================================================================");
-                Serial.printf("[TEST FINISHED] 10-Turn Bidirectional Spin Completed for Robot %d\n", Config::ID);
-                Serial.printf("   Net Integrated Gyro Yaw: %.2f deg (Nominal Return: 0.00 deg)\n", integratedYawDeg);
-                Serial.printf("   Final Measured INA226 Voltage: %.2f V\n", vbus_V);
-                Serial.println("======================================================================");
             }
         }
 
-        BidirectionalSpinRecord rec = {};
+        // 5. Stream Real-Time Telemetry to Core 0 Async Queue
+        SquareBenchmarkRecord rec = {};
         rec.timestamp_us = nowUs;
         rec.elapsed_ms = elapsedMs;
-        rec.phase = testPhase;
-        rec.target_rpm_l = targetRpmL;
-        rec.target_rpm_r = targetRpmR;
+        rec.state = state;
+        rec.pos_x_m = posX_m;
+        rec.pos_y_m = posY_m;
+        rec.filtered_yaw_deg = currentHeadingDeg;
+        rec.filtered_bias_dps = kf.getBiasDegS();
+        rec.raw_gyro_z_dps = gz_raw_dps;
         rec.meas_rpm_l = encL.getRPM();
         rec.meas_rpm_r = encR.getRPM();
         rec.pwm_duty_l = dutyL;
@@ -370,11 +401,7 @@ void loop() {
         rec.steps_r = stepsR;
         rec.vbus_v = vbus_V;
         rec.current_ma = current_mA;
-        rec.gyro_z_dps = gz_raw;
-        rec.integrated_yaw_deg = integratedYawDeg;
-        rec.enc_l_valid = encLValid ? 1 : 0;
-        rec.enc_r_valid = encRValid ? 1 : 0;
-        rec.ina_valid = inaValid ? 1 : 0;
+        rec.slip_detected = slip ? 1 : 0;
 
         if (sdLogQueue != nullptr) {
             xQueueSend(sdLogQueue, &rec, 0);
