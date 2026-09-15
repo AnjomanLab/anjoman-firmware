@@ -1,32 +1,54 @@
-#ifndef MOTOR_CONTROLLER_H
-#define MOTOR_CONTROLLER_H
+#pragma once
 
 #include <Arduino.h>
 
+struct MotorSysIDParams {
+    float deadbandFwd;
+    float deadbandRev;
+    float gainRpmFwd;
+    float gainRpmRev;
+    float vNominal;
+};
+
+struct PIDGains {
+    float kp;
+    float ki;
+    float integralLimit;
+};
+
 class MotorController {
 public:
-    MotorController(uint8_t pinIn1, uint8_t pinIn2, uint8_t ledcChan1, uint8_t ledcChan2);
+    MotorController(uint8_t pinIn1, uint8_t pinIn2, bool invert = false);
 
-    // Initial configuration
-    bool begin(uint32_t defaultFreq, uint8_t defaultResBits, float dutyLimit);
+    bool begin(uint32_t pwmFreqHz = 20000, uint8_t pwmResolutionBits = 10);
 
-    // Dynamic runtime update of frequency and bit resolution
-    void reconfigure(uint32_t newFreq, uint8_t newResBits);
+    void setCalibration(const MotorSysIDParams &params);
+    void setPIDGains(const PIDGains &gains);
 
-    // Set speed normalized from -1.0f to 1.0f
-    void setSpeed(float speed);
+    // Closed-loop velocity control (returns computed PWM command in [-1.0, 1.0])
+    float computeVelocityControl(float targetRPM, float measuredRPM, float vBatt, float dt, float crossCoupledTerm = 0.0f);
 
-    // Hard electrical brake
+    // Direct open-loop duty control [-1.0, 1.0]
+    void setOpenLoopDuty(float duty);
+
     void brake();
+    void coast();
+    void resetPID();
 
 private:
     uint8_t _pinIn1;
     uint8_t _pinIn2;
-    uint8_t _chan1;
-    uint8_t _chan2;
-    uint32_t _freq;
-    uint8_t _resBits;
-    float _dutyLimit;
-};
+    bool    _invert;
 
-#endif // MOTOR_CONTROLLER_H
+    uint32_t _pwmFreqHz;
+    uint8_t  _pwmResBits;
+    uint32_t _maxPwmTicks;
+
+    MotorSysIDParams _params;
+    PIDGains         _gains;
+
+    float _integralError;
+    float _lastDuty;
+
+    void writeHBridge(float duty);
+};

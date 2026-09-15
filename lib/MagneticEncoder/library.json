@@ -1,7 +1,7 @@
 {
   "name": "MagneticEncoder",
-  "version": "1.0.0",
-  "description": "AS5600 Magnetic Encoder driver with active TCA9548A I2C channel switching",
+  "version": "2.0.0",
+  "description": "AS5600 Magnetic Encoder driver with active TCA9548A I2C channel switching. Also add polarity inversion, 100 Hz velocity computation, and LPF",
   "keywords": "encoder, as5600, multiplexer, tca9548a, i2c",
   "repository": {
     "type": "git",

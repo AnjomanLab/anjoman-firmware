@@ -1,46 +1,43 @@
-#ifndef MAGNETIC_ENCODER_H
-#define MAGNETIC_ENCODER_H
+#pragma once
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <mutex>
 
 class MagneticEncoder {
 public:
-    // Constructor associating the encoder with its dedicated TCA9548A channel
-    MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress, uint8_t muxChannel);
+    MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress, uint8_t muxChannel, bool invert = false);
 
-    // Initializes the physical interface
     bool begin();
+    bool update(float dt);
 
-    // Selects the TCA9548A channel and reads the raw 12-bit angle (0 to 4095)
-    uint16_t readRawAngle();
+    uint16_t getRawAngle() const;
+    int16_t  getDeltaSteps() const;
+    int32_t  getCumulativeSteps() const;
+    float    getAngleRadians() const;
+    float    getRPM() const;
+    float    getRadPerSec() const;
 
-    // Reads raw angle and converts it to continuous radians taking roll-overs into account
-    float getAngleRadians();
-
-    // Resets cumulative odometry steps
     void resetCumulativeAngle();
 
 private:
     TwoWire &_wire;
     uint8_t _muxAddress;
     uint8_t _muxChannel;
-    
-    // AS5600 constant registers
-    const uint8_t AS5600_ADDR = 0x36;
-    const uint8_t ANGLE_REG_HIGH = 0x0E;
+    bool    _invert;
 
-    // Shared I2C Mutex across all encoders and devices on I2C1
-    static std::mutex _i2cBusMutex;
+    static constexpr uint8_t AS5600_ADDR      = 0x36;
+    static constexpr uint8_t ANGLE_REG_HIGH   = 0x0E;
+    static constexpr float   ENCODER_CPR      = 4096.0f;
+    static constexpr float   TWO_PI_F         = 6.28318530718f;
 
-    // Odometry tracking variables
-    int32_t _cumulativeSteps;
-    int16_t _lastRawAngle;
-    bool _isFirstRead;
+    uint16_t _currentRawAngle;
+    int16_t  _lastRawAngle;
+    int16_t  _lastDelta;
+    int32_t  _cumulativeSteps;
+    bool     _isFirstRead;
 
-    // Internal helper to switch TCA9548A multiplexer channel
+    float    _currentRPM;
+    float    _currentRadPerSec;
+
     bool selectMuxChannel();
 };
-
-#endif // MAGNETIC_ENCODER_H

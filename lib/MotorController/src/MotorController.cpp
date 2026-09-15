@@ -1,63 +1,122 @@
 #include "MotorController.h"
+#include <cmath>
 
-MotorController::MotorController(uint8_t pinIn1, uint8_t pinIn2, uint8_t ledcChan1, uint8_t ledcChan2)
-    : _pinIn1(pinIn1), _pinIn2(pinIn2), _chan1(ledcChan1), _chan2(ledcChan2), 
-      _freq(5000), _resBits(10), _dutyLimit(1.0f) {}
+MotorController::MotorController(uint8_t pinIn1, uint8_t pinIn2, bool invert)
+    : _pinIn1(pinIn1),
+      _pinIn2(pinIn2),
+      _invert(invert),
+      _pwmFreqHz(20000),
+      _pwmResBits(10),
+      _maxPwmTicks(1023),
+      _integralError(0.0f),
+      _lastDuty(0.0f) {
+    _params = {0.40f, 0.40f, 200.0f, 200.0f, 7.40f};
+    _gains  = {0.0025f, 0.015f, 0.30f};
+}
 
-bool MotorController::begin(uint32_t defaultFreq, uint8_t defaultResBits, float dutyLimit) {
-    _freq = defaultFreq;
-    _resBits = defaultResBits;
-    _dutyLimit = dutyLimit;
+bool MotorController::begin(uint32_t pwmFreqHz, uint8_t pwmResolutionBits) {
+    _pwmFreqHz = pwmFreqHz;
+    _pwmResBits = pwmResolutionBits;
+    _maxPwmTicks = (1 << _pwmResBits) - 1;
 
     pinMode(_pinIn1, OUTPUT);
     pinMode(_pinIn2, OUTPUT);
 
-    ledcSetup(_chan1, _freq, _resBits);
-    ledcSetup(_chan2, _freq, _resBits);
-
-    ledcAttachPin(_pinIn1, _chan1);
-    ledcAttachPin(_pinIn2, _chan2);
+    // Modern ESP32 Arduino Core 3.x API
+    ledcAttach(_pinIn1, _pwmFreqHz, _pwmResBits);
+    ledcAttach(_pinIn2, _pwmFreqHz, _pwmResBits);
 
     brake();
     return true;
 }
 
-void MotorController::reconfigure(uint32_t newFreq, uint8_t newResBits) {
-    _freq = newFreq;
-    _resBits = newResBits;
-    
-    // De-attach first to prevent pin allocation faults on core registers
-    ledcDetachPin(_pinIn1);
-    ledcDetachPin(_pinIn2);
-
-    ledcSetup(_chan1, _freq, _resBits);
-    ledcSetup(_chan2, _freq, _resBits);
-
-    ledcAttachPin(_pinIn1, _chan1);
-    ledcAttachPin(_pinIn2, _chan2);
+void MotorController::setCalibration(const MotorSysIDParams &params) {
+    _params = params;
 }
 
-void MotorController::setSpeed(float speed) {
-    speed = constrain(speed, -1.0f, 1.0f);
-    
-    uint32_t max_val = (1 << _resBits) - 1;
-    uint32_t maxAllowedDuty = (uint32_t)((float)max_val * _dutyLimit);
+void MotorController::setPIDGains(const PIDGains &gains) {
+    _gains = gains;
+}
 
-    if (speed > 0.01f) {
-        uint32_t duty = (uint32_t)(speed * (float)maxAllowedDuty);
-        ledcWrite(_chan1, duty);
-        ledcWrite(_chan2, 0);
-    } else if (speed < -0.01f) {
-        uint32_t duty = (uint32_t)(-speed * (float)maxAllowedDuty);
-        ledcWrite(_chan1, 0);
-        ledcWrite(_chan2, duty);
+void MotorController::resetPID() {
+    _integralError = 0.0f;
+    _lastDuty = 0.0f;
+}
+
+float MotorController::computeVelocityControl(float targetRPM, float measuredRPM, float vBatt, float dt, float crossCoupledTerm) {
+    if (fabs(targetRPM) < 0.5f) {
+        resetPID();
+        brake();
+        return 0.0f;
+    }
+
+    // Protect against invalid voltage readings
+    if (vBatt < 5.5f) {
+        vBatt = _params.vNominal;
+    }
+
+    float vRatio = _params.vNominal / vBatt;
+    bool isFwd = (targetRPM >= 0.0f);
+
+    float deadband = isFwd ? _params.deadbandFwd : _params.deadbandRev;
+    float gain     = isFwd ? _params.gainRpmFwd  : _params.gainRpmRev;
+
+    // 1. Voltage-Compensated Feedforward
+    float u_ff = 0.0f;
+    if (gain > 1.0f) {
+        float baseEffort = (fabs(targetRPM) / gain) * vRatio;
+        float deadbandComp = deadband * vRatio;
+        u_ff = (isFwd ? 1.0f : -1.0f) * (deadbandComp + baseEffort);
+    }
+
+    // 2. Closed-Loop Feedback (PI)
+    float error = targetRPM - measuredRPM;
+    
+    _integralError += error * dt;
+    _integralError = constrain(_integralError, -_gains.integralLimit, _gains.integralLimit);
+
+    float u_fb = (_gains.kp * error) + (_gains.ki * _integralError);
+
+    // 3. Combine Feedforward + Feedback + Cross-Coupling Correction
+    float u_total = u_ff + u_fb + crossCoupledTerm;
+    u_total = constrain(u_total, -1.0f, 1.0f);
+
+    _lastDuty = u_total;
+    writeHBridge(u_total);
+
+    return u_total;
+}
+
+void MotorController::setOpenLoopDuty(float duty) {
+    duty = constrain(duty, -1.0f, 1.0f);
+    _lastDuty = duty;
+    writeHBridge(duty);
+}
+
+void MotorController::writeHBridge(float duty) {
+    if (_invert) {
+        duty = -duty;
+    }
+
+    if (duty > 0.01f) {
+        uint32_t val = (uint32_t)(fabs(duty) * (float)_maxPwmTicks);
+        ledcWrite(_pinIn1, val);
+        ledcWrite(_pinIn2, 0);
+    } else if (duty < -0.01f) {
+        uint32_t val = (uint32_t)(fabs(duty) * (float)_maxPwmTicks);
+        ledcWrite(_pinIn1, 0);
+        ledcWrite(_pinIn2, val);
     } else {
         brake();
     }
 }
 
 void MotorController::brake() {
-    uint32_t max_val = (1 << _resBits) - 1;
-    ledcWrite(_chan1, max_val);
-    ledcWrite(_chan2, max_val);
+    ledcWrite(_pinIn1, _maxPwmTicks);
+    ledcWrite(_pinIn2, _maxPwmTicks);
+}
+
+void MotorController::coast() {
+    ledcWrite(_pinIn1, 0);
+    ledcWrite(_pinIn2, 0);
 }
