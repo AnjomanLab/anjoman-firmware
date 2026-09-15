@@ -37,8 +37,9 @@ namespace Config {
     // ==============================================================================
 #if ROBOT_ID == 1
     constexpr uint8_t ID                     = 1;
-    constexpr float   TRACK_WIDTH_M          = 0.1350f;  // 135 mm track width
-
+    constexpr float   TRACK_WIDTH_NOM_M      = 0.1350f;  // 135 mm CAD/nominal track width
+    constexpr float   TRACK_WIDTH_EFF_M      = 0.1237f;  // 123.7 mm decoupled effective track width
+    constexpr float   TRACK_WIDTH_M          = TRACK_WIDTH_EFF_M; // Use effective for kinematic equations
     // Verified Motor Polarities (Forward Command = Forward Wheel Spin)
     constexpr bool    INVERT_MOTOR_LEFT      = false;
     constexpr bool    INVERT_MOTOR_RIGHT     = true;
@@ -69,14 +70,15 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f; // Gyro bias drift variance (rad/s)^2
     constexpr float   R_YAW_ENCODER          = 1.45e-6f;  // Differential encoder measurement noise (rad^2)
 
-    // Geometric Lever-Arm Offset [Lateral (Y), Longitudinal (X)]
-    constexpr float   IMU_OFFSET_LAT_M       = 0.0275f;
-    constexpr float   IMU_OFFSET_LON_M       = 0.0300f;
+    // Geometric Lever-Arm Offset from Wheel Axle Center [Longitudinal (X), Lateral (Y)]
+    constexpr float   IMU_OFFSET_LON_M       = 0.0358f;  // 35.8 mm forward of wheel axle
+    constexpr float   IMU_OFFSET_LAT_M       = -0.0284f; // 28.4 mm to the right of centerline
 
 #elif ROBOT_ID == 2
     constexpr uint8_t ID                     = 2;
-    constexpr float   TRACK_WIDTH_M          = 0.1250f;  // 125 mm track width
-
+    constexpr float   TRACK_WIDTH_NOM_M      = 0.1250f;  // 125 mm CAD/nominal track width
+    constexpr float   TRACK_WIDTH_EFF_M      = 0.1248f;  // 124.8 mm decoupled effective track width
+    constexpr float   TRACK_WIDTH_M          = TRACK_WIDTH_EFF_M;
     constexpr bool    INVERT_MOTOR_LEFT      = true;
     constexpr bool    INVERT_MOTOR_RIGHT     = true;
 
@@ -103,13 +105,14 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
-    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;
-    constexpr float   IMU_OFFSET_LON_M       = 0.0550f;
+    constexpr float   IMU_OFFSET_LON_M       = 0.0516f;  // 51.58 mm forward of wheel axle
+    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;  // Centered laterally on chassis
 
 #elif ROBOT_ID == 3
     constexpr uint8_t ID                     = 3;
-    constexpr float   TRACK_WIDTH_M          = 0.1250f;
-
+    constexpr float   TRACK_WIDTH_NOM_M      = 0.1250f;  // 125 mm CAD/nominal track width
+    constexpr float   TRACK_WIDTH_EFF_M      = 0.1163f;  // 116.3 mm decoupled effective track width
+    constexpr float   TRACK_WIDTH_M          = TRACK_WIDTH_EFF_M;
     constexpr bool    INVERT_MOTOR_LEFT      = false;
     constexpr bool    INVERT_MOTOR_RIGHT     = true;
 
@@ -136,13 +139,14 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
-    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;
-    constexpr float   IMU_OFFSET_LON_M       = 0.0550f;
+    constexpr float   IMU_OFFSET_LON_M       = 0.0590f;  // 59.0 mm forward of wheel axle
+    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;  // Centered laterally on chassis
 
 #elif ROBOT_ID == 4
     constexpr uint8_t ID                     = 4;
-    constexpr float   TRACK_WIDTH_M          = 0.1250f;
-
+    constexpr float   TRACK_WIDTH_NOM_M      = 0.1250f;  // 125 mm CAD/nominal track width
+    constexpr float   TRACK_WIDTH_EFF_M      = 0.1209f;  // 120.9 mm decoupled effective track width
+    constexpr float   TRACK_WIDTH_M          = TRACK_WIDTH_EFF_M;
     constexpr bool    INVERT_MOTOR_LEFT      = true;
     constexpr bool    INVERT_MOTOR_RIGHT     = false;
 
@@ -169,8 +173,9 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
-    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;
-    constexpr float   IMU_OFFSET_LON_M       = 0.0550f;
+    constexpr float   IMU_OFFSET_LON_M       = 0.0578f;  // 57.8 mm forward of wheel axle
+    constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;  // Centered laterally on chassis
+
 #endif
 
     // ==============================================================================
