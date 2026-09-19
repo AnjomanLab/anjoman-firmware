@@ -1,411 +1,653 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <SPI.h>
-#include <SD.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <DW1000Ng.hpp>
+#include <DW1000NgUtils.hpp>
+#include <DW1000NgRanging.hpp>
+
 #include "PinMap.h"
 #include "RobotConfig.h"
-#include "MagneticEncoder.h"
-#include "MotorController.h"
-#include "BMI160_Custom.h"
-#include "HeadingKalmanFilter.h"
 
 // ==============================================================================
-// 1. HARDWARE & KINEMATIC CONSTANTS
+// 1. HARDWARE TIME CONSTANTS & PHYSICAL EQUATIONS
 // ==============================================================================
-constexpr uint8_t  TCA9548A_ADDR       = 0x70;
-constexpr uint8_t  INA226_ADDR         = 0x40;
-constexpr uint32_t I2C_CLOCK_FREQ_HZ  = 400000;
-constexpr uint32_t CONTROL_RATE_HZ     = 100;
-constexpr uint32_t SAMPLE_PERIOD_US   = 1000000 / CONTROL_RATE_HZ; // 10 ms
-constexpr float    CONTROL_PERIOD_S    = 0.010f;
+constexpr double   SPEED_OF_LIGHT         = 299792458.0;
+constexpr double   TIME_UNIT_SEC          = 0.000000000015650040064103;
 
-// Calibrated Physical Constants
-constexpr float    R_EFF_M             = Config::WHEEL_RADIUS_M; // 0.02685 m
-constexpr float    W_EFF_M             = Config::TRACK_WIDTH_M;  // Decoupled effective track width
+// Verified hardware reply delay for all robots: exactly 2.5 ms (159,744,000 ticks)
+constexpr uint64_t SCHEDULED_REPLY_DELAY  = 159744000ULL; 
 
-// 1.000m Straight Leg Target Ticks:
-constexpr int32_t  LEG_TARGET_TICKS    = (int32_t)((1.000f / (2.0f * PI * R_EFF_M)) * Config::ENCODER_CPR); // 24278 ticks
-constexpr float    CRUISE_SPEED_MPS    = 0.15f;
-constexpr float    CRUISE_RPM          = (CRUISE_SPEED_MPS / (2.0f * PI * R_EFF_M)) * 60.0f; // 53.30 RPM
-constexpr float    TURN_RPM            = 30.0f; // Stable 90-degree in-place turn speed
+// Deterministic 200 ms TDMA Frame (5 Hz full mesh update rate)
+constexpr uint32_t TDMA_FRAME_US          = 200000; 
+constexpr uint32_t PREFLIGHT_TIMEOUT_MS   = 4000;   // 4-second initial link check
 
-constexpr float    SHUNT_RESISTOR_OHM  = Config::SHUNT_RESISTOR_OHM;
+// Official Decawave Carrier Integrator conversion constants (Channel 5, N=1024)
+constexpr double   FREQ_OFFSET_MULTIPLIER         = 998.4e6 / (2.0 * 1024.0 * 131072.0); // ~3.71933 Hz/count
+constexpr double   HERTZ_TO_PPM_MULTIPLIER_CHAN_5 = -1.0e6 / 6489.6e6;                   // ~-1.5409e-4 ppm/Hz
 
-// Hardware Interfaces
-SPIClass SPI_SD(HSPI);
-File logFile;
-bool sdCardReady = false;
-bool ina226Ready = false;
+uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-MagneticEncoder encL(Wire, TCA9548A_ADDR, 0, Config::INVERT_ENCODER_LEFT);
-MagneticEncoder encR(Wire, TCA9548A_ADDR, 1, Config::INVERT_ENCODER_RIGHT);
-MotorController motorL(PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, Config::INVERT_MOTOR_LEFT);
-MotorController motorR(PIN_MOTOR_R_IN1, PIN_MOTOR_R_IN2, Config::INVERT_MOTOR_RIGHT);
-BMI160_Custom   imu(Wire, 0x69, 2);
-HeadingKalmanFilter kf;
-
-// 2D Dead Reckoning Position State
-float posX_m = 0.0f;
-float posY_m = 0.0f;
+device_configuration_t UWB_CONFIG = {
+    false,
+    true,
+    true,
+    true,
+    false,
+    SFDMode::STANDARD_SFD,
+    Channel::CHANNEL_5,
+    DataRate::RATE_850KBPS,
+    PulseFrequency::FREQ_16MHZ,
+    PreambleLength::LEN_256,
+    PreambleCode::CODE_3
+};
 
 #pragma pack(push, 1)
-struct SquareBenchmarkRecord {
-    uint64_t timestamp_us;
-    uint32_t elapsed_ms;
-    uint8_t  state;              // 0: ZUPT, 1..4: Straight Legs, 11..14: 90-deg Turns, 99: Done
-    float    pos_x_m;
-    float    pos_y_m;
-    float    filtered_yaw_deg;
-    float    filtered_bias_dps;
-    float    raw_gyro_z_dps;
-    float    meas_rpm_l;
-    float    meas_rpm_r;
-    float    pwm_duty_l;
-    float    pwm_duty_r;
-    int32_t  steps_l;
-    int32_t  steps_r;
-    float    vbus_v;
-    float    current_ma;
-    uint8_t  slip_detected;
+struct UWBPollPacket {
+    char     header[4];      // "POLL"
+    uint8_t  initiatorId;    
+    uint8_t  targetId;       
+    uint32_t sequence;
+};
+
+struct UWBResponsePacket {
+    char     header[4];      // "RESP"
+    uint8_t  responderId;    
+    uint8_t  targetId;       
+    uint32_t sequence;
+    uint8_t  rxTimestamp[5]; // tRx2 (40-bit)
+    uint8_t  txTimestamp[5]; // tTx2 (40-bit)
+    float    tempUwb;        // Cached DW1000 internal temp
+    float    tempEsp;        // Cached ESP32 temp
+};
+
+struct SyncBeaconPacket {
+    uint32_t frameId;
+    uint32_t timestampMs;
+};
+
+// 22-Parameter Pure Telemetry Record
+struct FullEdgeTelemetry {
+    uint32_t timestampMs;
+    uint32_t frameId;
+    uint8_t  initiatorId;
+    uint8_t  responderId;
+    uint8_t  status;         // 1 = Success, 0 = Timeout/Loss
+    int32_t  carrierIntegrator;
+    float    cfoPpm;
+    int64_t  tofUncompTicks;
+    int64_t  tofCompTicks;
+    float    distUncompM;
+    float    distClockCompM;
+    float    distRssiCompM;
+    float    distCalibM;
+    float    rssi_dbm;
+    uint64_t tTx1;
+    uint64_t tRx1;
+    uint64_t tRx2;
+    uint64_t tTx2;
+    float    tempUwbInit;
+    float    tempUwbResp;
+    float    tempEspInit;
+    float    tempEspResp;
 };
 #pragma pack(pop)
 
-QueueHandle_t sdLogQueue = nullptr;
-TaskHandle_t  core0TaskHandle = nullptr;
-
-bool selectTCAChannel(uint8_t ch) {
-    if (ch > 7) return false;
-    Wire.beginTransmission(TCA9548A_ADDR);
-    Wire.write(1 << ch);
-    return (Wire.endTransmission() == 0);
+inline void write40BitTime(uint8_t *dest, uint64_t val) {
+    dest[0] = (uint8_t)(val & 0xFF);
+    dest[1] = (uint8_t)((val >> 8) & 0xFF);
+    dest[2] = (uint8_t)((val >> 16) & 0xFF);
+    dest[3] = (uint8_t)((val >> 24) & 0xFF);
+    dest[4] = (uint8_t)((val >> 32) & 0xFF);
 }
 
-bool initINA226() {
-    if (!selectTCAChannel(3)) return false;
-    Wire.beginTransmission(INA226_ADDR);
-    if (Wire.endTransmission() != 0) return false;
-
-    Wire.beginTransmission(INA226_ADDR);
-    Wire.write(0x00); Wire.write(0x80); Wire.write(0x00);
-    Wire.endTransmission();
-    delay(10);
-
-    Wire.beginTransmission(INA226_ADDR);
-    Wire.write(0x00); Wire.write(0x42); Wire.write(0x27);
-    return (Wire.endTransmission() == 0);
+inline uint64_t read40BitTime(const uint8_t *src) {
+    return ((uint64_t)src[0]) |
+           (((uint64_t)src[1]) << 8) |
+           (((uint64_t)src[2]) << 16) |
+           (((uint64_t)src[3]) << 24) |
+           (((uint64_t)src[4]) << 32);
 }
 
-bool readINA226(float &vbus_V, float &current_mA) {
-    vbus_V = current_mA = 0.0f;
-    if (!selectTCAChannel(3)) return false;
+volatile uint32_t globalFrameId = 0;
+volatile uint64_t frameStartUs   = 0;
+bool isFrameSynced = false;
+bool inRxMode = false;
 
-    Wire.beginTransmission(INA226_ADDR);
-    Wire.write(0x02);
-    if (Wire.endTransmission() != 0) return false;
-    Wire.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2);
-    if (Wire.available() < 2) return false;
-    uint16_t rawBus = (Wire.read() << 8) | Wire.read();
-    vbus_V = (float)rawBus * 0.00125f;
+float cachedTempUwb = 25.0f;
+float cachedTempEsp = 25.0f;
 
-    Wire.beginTransmission(INA226_ADDR);
-    Wire.write(0x01);
-    if (Wire.endTransmission() != 0) return false;
-    Wire.requestFrom((uint8_t)INA226_ADDR, (uint8_t)2);
-    if (Wire.available() < 2) return false;
-    int16_t rawShunt = (int16_t)((Wire.read() << 8) | Wire.read());
-    float vshunt_mV = (float)rawShunt * 0.0025f;
+FullEdgeTelemetry fleetTelemetry[6]; // Storage for all 6 edges: (1,2), (1,3), (1,4), (2,3), (2,4), (3,4)
 
-    current_mA = vshunt_mV / SHUNT_RESISTOR_OHM;
-    return true;
-}
+// ==============================================================================
+// 2. ESP-NOW MESH NETWORKING
+// ==============================================================================
+void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
+    if (data_len == sizeof(SyncBeaconPacket)) {
+        SyncBeaconPacket pkt;
+        memcpy(&pkt, data, sizeof(SyncBeaconPacket));
+        globalFrameId = pkt.frameId;
+        frameStartUs = micros();
+        isFrameSynced = true;
+    } else if (data_len == sizeof(FullEdgeTelemetry)) {
+        FullEdgeTelemetry edge;
+        memcpy(&edge, data, sizeof(FullEdgeTelemetry));
+        
+        uint8_t idx = 0xFF;
+        if (edge.initiatorId == 1 && edge.responderId == 2) idx = 0;
+        else if (edge.initiatorId == 1 && edge.responderId == 3) idx = 1;
+        else if (edge.initiatorId == 1 && edge.responderId == 4) idx = 2;
+        else if (edge.initiatorId == 2 && edge.responderId == 3) idx = 3;
+        else if (edge.initiatorId == 2 && edge.responderId == 4) idx = 4;
+        else if (edge.initiatorId == 3 && edge.responderId == 4) idx = 5;
 
-void core0LoggerTask(void *pvParameters) {
-    SquareBenchmarkRecord rec;
-    uint32_t recordsLogged = 0;
-
-    while (true) {
-        if (xQueueReceive(sdLogQueue, &rec, portMAX_DELAY) == pdTRUE) {
-            if (sdCardReady && logFile) {
-                logFile.printf("%llu,%lu,%u,%.4f,%.4f,%.2f,%.3f,%.2f,%.2f,%.2f,%.3f,%.3f,%ld,%ld,%.2f,%.1f,%u\n",
-                               (unsigned long long)rec.timestamp_us,
-                               (unsigned long)rec.elapsed_ms,
-                               rec.state,
-                               rec.pos_x_m, rec.pos_y_m,
-                               rec.filtered_yaw_deg, rec.filtered_bias_dps, rec.raw_gyro_z_dps,
-                               rec.meas_rpm_l, rec.meas_rpm_r,
-                               rec.pwm_duty_l, rec.pwm_duty_r,
-                               (long)rec.steps_l, (long)rec.steps_r,
-                               rec.vbus_v, rec.current_ma,
-                               rec.slip_detected);
-
-                recordsLogged++;
-                if (recordsLogged % 50 == 0) {
-                    logFile.flush();
-                }
-            }
+        if (idx != 0xFF) {
+            fleetTelemetry[idx] = edge;
         }
     }
 }
 
+void setupESPNow() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ERROR] ESP-NOW Init Failed!");
+        return;
+    }
+
+    esp_now_register_recv_cb(onDataRecv);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, BROADCAST_MAC, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&peerInfo);
+}
+
+// ==============================================================================
+// 3. DW1000 HARDWARE INITIALIZATION
+// ==============================================================================
+void setupUWB() {
+    pinMode(PIN_UWB_RST, OUTPUT);
+    digitalWrite(PIN_UWB_RST, LOW);
+    delay(10);
+    pinMode(PIN_UWB_RST, INPUT);
+    delay(25);
+
+    SPI.begin(PIN_UWB_SCK, PIN_UWB_MISO, PIN_UWB_MOSI, PIN_UWB_CS);
+    delay(10);
+
+    DW1000Ng::initializeNoInterrupt(PIN_UWB_CS, PIN_UWB_RST);
+    DW1000Ng::applyConfiguration(UWB_CONFIG);
+
+    DW1000Ng::setDeviceAddress(Config::ID);
+    DW1000Ng::setNetworkId(0xDECA);
+    DW1000Ng::setAntennaDelay(16436);
+
+    DW1000Ng::clearReceiveStatus();
+    DW1000Ng::clearTransmitStatus();
+    DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+    inRxMode = true;
+}
+
+// ==============================================================================
+// 4. SS-TWR ENGINE WITH CARRIER-INTEGRATOR COMPENSATION
+// ==============================================================================
+bool performRangingPoll(uint8_t targetPeerId, FullEdgeTelemetry &rec) {
+    rec.timestampMs       = millis();
+    rec.frameId           = globalFrameId;
+    rec.initiatorId       = Config::ID;
+    rec.responderId       = targetPeerId;
+    rec.status            = 0; // Failed by default
+    rec.carrierIntegrator = 0;
+    rec.cfoPpm            = 0.0f;
+    rec.tofUncompTicks    = 0;
+    rec.tofCompTicks      = 0;
+    rec.distUncompM       = 0.0f;
+    rec.distClockCompM    = 0.0f;
+    rec.distRssiCompM     = 0.0f;
+    rec.distCalibM        = 0.0f;
+    rec.rssi_dbm          = 0.0f;
+    rec.tTx1 = rec.tRx1 = rec.tRx2 = rec.tTx2 = 0;
+    rec.tempUwbInit       = cachedTempUwb;
+    rec.tempUwbResp       = 0.0f;
+    rec.tempEspInit       = cachedTempEsp;
+    rec.tempEspResp       = 0.0f;
+
+    UWBPollPacket pollPkt = {};
+    memcpy(pollPkt.header, "POLL", 4);
+    pollPkt.initiatorId   = Config::ID;
+    pollPkt.targetId      = targetPeerId;
+    pollPkt.sequence      = globalFrameId;
+
+    DW1000Ng::forceTRxOff();
+    DW1000Ng::clearTransmitStatus();
+    DW1000Ng::clearReceiveStatus();
+
+    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
+    DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
+
+    uint32_t txStart = millis();
+    while (!DW1000Ng::isTransmitDone()) {
+        if (millis() - txStart > 6) {
+            inRxMode = false;
+            return false;
+        }
+        yield();
+    }
+    DW1000Ng::clearTransmitStatus();
+    uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
+
+    // Await Response with generous 10 ms window
+    DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+    inRxMode = true;
+    uint32_t waitRx = millis();
+    bool success = false;
+
+    while (millis() - waitRx < 10) {
+        if (DW1000Ng::isReceiveDone()) {
+            DW1000Ng::clearReceiveStatus();
+
+            size_t len = DW1000Ng::getReceivedDataLength();
+            if (len >= sizeof(UWBResponsePacket)) {
+                UWBResponsePacket respPkt;
+                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
+
+                if (memcmp(respPkt.header, "RESP", 4) == 0 &&
+                    respPkt.responderId == targetPeerId &&
+                    respPkt.targetId == Config::ID) {
+
+                    // 1. Capture Timestamps
+                    uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
+                    uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
+                    uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
+
+                    // 2. Read Raw Carrier Integrator ONCE
+                    int32_t ci = DW1000Ng::getCarrierIntegrator();
+
+                    // 3. Compute Official Decawave CFO & Clock Offset Ratio
+                    double cfoPpm = (double)ci * FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5;
+                    double clockOffsetRatio = cfoPpm * 1.0e-6;
+
+                    // 4. Raw Durations
+                    int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
+                    int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
+
+                    // A) Uncompensated Raw SS-TWR (Displays the legacy 20-40m bias)
+                    int64_t tofUncomp = (tRound - tReply) / 2;
+                    double distUncomp = (double)tofUncomp * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+
+                    // B) Clock-Offset Compensated SS-TWR (Official Decawave Formulation)
+                    double tReplyCorrected = (double)tReply * (1.0 + clockOffsetRatio);
+                    double tofComp = ((double)tRound - tReplyCorrected) / 2.0;
+                    double distClockComp = tofComp * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+
+                    // C) Decawave Internal RSSI Power Bias Correction Curve
+                    double distRssiComp = (double)DW1000NgRanging::correctRange((float)distClockComp);
+
+                    // D) Final Zero-Offset Calibration
+                    double distCalib = Config::getCalibratedDistance(Config::ID, targetPeerId, (float)distRssiComp);
+
+                    // Pack into Telemetry
+                    rec.status            = 1;
+                    rec.carrierIntegrator = ci;
+                    rec.cfoPpm            = (float)cfoPpm;
+                    rec.tofUncompTicks    = tofUncomp;
+                    rec.tofCompTicks      = (int64_t)tofComp;
+                    rec.distUncompM       = (float)distUncomp;
+                    rec.distClockCompM    = (float)distClockComp;
+                    rec.distRssiCompM     = (float)distRssiComp;
+                    rec.distCalibM        = (float)distCalib;
+                    rec.rssi_dbm          = (float)DW1000Ng::getReceivePower();
+                    rec.tTx1              = tTx1;
+                    rec.tRx1              = tRx1;
+                    rec.tRx2              = tRx2;
+                    rec.tTx2              = tTx2;
+                    rec.tempUwbResp       = respPkt.tempUwb;
+                    rec.tempEspResp       = respPkt.tempEsp;
+
+                    success = true;
+                }
+            }
+            break;
+        }
+        yield();
+    }
+
+    DW1000Ng::forceTRxOff();
+    inRxMode = false;
+    return success;
+}
+
+void performRangingListenSafe() {
+    static uint32_t rxArmedTime = 0;
+
+    if (!inRxMode) {
+        DW1000Ng::forceTRxOff();
+        DW1000Ng::clearReceiveStatus();
+        DW1000Ng::clearReceiveFailedStatus();
+        DW1000Ng::clearReceiveTimeoutStatus();
+        DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+        inRxMode = true;
+        rxArmedTime = millis();
+    }
+
+    // Auto-recovery Watchdog: if receiver is stuck or errored for > 15ms, clear and re-arm
+    if (DW1000Ng::isReceiveFailed() || (millis() - rxArmedTime > 15)) {
+        DW1000Ng::forceTRxOff();
+        DW1000Ng::clearReceiveStatus();
+        DW1000Ng::clearReceiveFailedStatus();
+        DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+        inRxMode = true;
+        rxArmedTime = millis();
+        return;
+    }
+
+    if (DW1000Ng::isReceiveDone()) {
+        DW1000Ng::clearReceiveStatus();
+
+        size_t len = DW1000Ng::getReceivedDataLength();
+        if (len >= sizeof(UWBPollPacket)) {
+            UWBPollPacket pollPkt;
+            DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
+
+            if (memcmp(pollPkt.header, "POLL", 4) == 0 && pollPkt.targetId == Config::ID) {
+                uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
+                uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) & 0xFFFFFFFE00ULL;
+
+                UWBResponsePacket respPkt = {};
+                memcpy(respPkt.header, "RESP", 4);
+                respPkt.responderId = Config::ID;
+                respPkt.targetId    = pollPkt.initiatorId;
+                respPkt.sequence    = pollPkt.sequence;
+                write40BitTime(respPkt.rxTimestamp, tRx2);
+                write40BitTime(respPkt.txTimestamp, tTx2);
+                respPkt.tempUwb     = cachedTempUwb;
+                respPkt.tempEsp     = cachedTempEsp;
+
+                DW1000Ng::forceTRxOff();
+                DW1000Ng::clearTransmitStatus();
+                DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
+                DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
+                DW1000Ng::startTransmit(TransmitMode::DELAYED);
+
+                uint32_t txWait = millis();
+                while (!DW1000Ng::isTransmitDone()) {
+                    if (millis() - txWait > 8) break;
+                    yield();
+                }
+                DW1000Ng::clearTransmitStatus();
+            }
+        }
+        
+        DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+        inRxMode = true;
+        rxArmedTime = millis();
+    }
+}
+
+// ==============================================================================
+// 5. PRE-FLIGHT SANITY CHECK (PST) ROUTINE
+// ==============================================================================
+bool runPreflightSanityCheck() {
+    Serial.println("# [PST] Running 4-Second Pre-Flight Link Sanity Check...");
+    uint32_t pstStart = millis();
+    bool peerOk[4] = {false, false, false, false}; // Indices 1..3 for R2, R3, R4
+
+    while (millis() - pstStart < PREFLIGHT_TIMEOUT_MS) {
+        if (Config::ID == 1) {
+            for (uint8_t target = 2; target <= 4; target++) {
+                FullEdgeTelemetry dummy;
+                if (performRangingPoll(target, dummy)) {
+                    peerOk[target - 1] = true;
+                }
+                delay(15);
+            }
+            if (peerOk[1] && peerOk[2] && peerOk[3]) break;
+        } else {
+            performRangingListenSafe();
+        }
+        yield();
+    }
+
+    if (Config::ID == 1) {
+        bool allOk = (peerOk[1] && peerOk[2] && peerOk[3]);
+        if (allOk) {
+            Serial.println("# [PST SUCCESS] All 3 peer robots (R2, R3, R4) responded cleanly!");
+            return true;
+        } else {
+            Serial.printf("# [PST WARNING] Unresponsive peers: %s %s %s\n",
+                          peerOk[1] ? "" : "ROBOT_2_DEAD!",
+                          peerOk[2] ? "" : "ROBOT_3_DEAD!",
+                          peerOk[3] ? "" : "ROBOT_4_DEAD!");
+            return false;
+        }
+    }
+    return true;
+}
+
+// ==============================================================================
+// 6. SETUP
+// ==============================================================================
 void setup() {
     Serial.begin(460800);
     delay(1000);
 
-    rgbLedWrite(PIN_STATUS_RGB, 20, 10, 0); // Amber
+    // Lock motors in safe electrical brake mode
+    pinMode(PIN_MOTOR_L_IN1, OUTPUT); pinMode(PIN_MOTOR_L_IN2, OUTPUT);
+    pinMode(PIN_MOTOR_R_IN1, OUTPUT); pinMode(PIN_MOTOR_R_IN2, OUTPUT);
+    digitalWrite(PIN_MOTOR_L_IN1, HIGH); digitalWrite(PIN_MOTOR_L_IN2, HIGH);
+    digitalWrite(PIN_MOTOR_R_IN1, HIGH); digitalWrite(PIN_MOTOR_R_IN2, HIGH);
 
-    Wire.begin(PIN_I2C0_SDA, PIN_I2C0_SCL, I2C_CLOCK_FREQ_HZ);
-    delay(50);
+    setupESPNow();
+    setupUWB();
 
-    encL.begin();
-    encR.begin();
+    // Initial temperature capture with validity guard
+    float t_raw = DW1000Ng::getTemperature();
+    cachedTempEsp = temperatureRead();
+    if (t_raw > -30.0f && t_raw < 90.0f) {
+        cachedTempUwb = t_raw;
+    } else {
+        cachedTempUwb = cachedTempEsp - 1.5f; // Safe empirical fallback for unburned OTP
+    }
 
-    motorL.begin(20000, 10);
-    motorR.begin(20000, 10);
+    bool pstPassed = runPreflightSanityCheck();
+    if (!pstPassed && Config::ID == 1) {
+        rgbLedWrite(PIN_STATUS_RGB, 60, 0, 0); // Blink Red on missing peer
+    } else {
+        rgbLedWrite(PIN_STATUS_RGB, 0, 0, 40); // Solid Blue (Active Measurement)
+    }
 
-    MotorSysIDParams paramsL = {
-        Config::DEADBAND_FWD_L, Config::DEADBAND_REV_L,
-        Config::GAIN_RPM_FWD_L, Config::GAIN_RPM_REV_L,
-        7.40f
-    };
-    MotorSysIDParams paramsR = {
-        Config::DEADBAND_FWD_R, Config::DEADBAND_REV_R,
-        Config::GAIN_RPM_FWD_R, Config::GAIN_RPM_REV_R,
-        7.40f
-    };
-    motorL.setCalibration(paramsL);
-    motorR.setCalibration(paramsR);
+    // 22-Column Full Metrology Telemetry Header
+    if (Config::ID == 1) {
+        Serial.println("timestamp_ms,frame_id,init_id,resp_id,status,carrier_int,cfo_ppm,tof_uncomp,tof_comp,dist_uncomp_m,dist_clock_m,dist_rssi_m,dist_calib_m,rssi_dbm,tTx1,tRx1,tRx2,tTx2,temp_uwb_init,temp_uwb_resp,temp_esp_init,temp_esp_resp");
+    }
+}
 
-    PIDGains gainsL = {0.0030f, 0.0250f, 0.25f};
-    PIDGains gainsR = {0.0030f, 0.0250f, 0.25f};
-    motorL.setPIDGains(gainsL);
-    motorR.setPIDGains(gainsR);
+// ==============================================================================
+// 7. DETERMINISTIC 200 ms TDMA LOOP (20 ms DEDICATED SLOTS)
+// ==============================================================================
+void loop() {
+    uint32_t nowMs = millis();
 
-    imu.begin();
-    ina226Ready = initINA226();
+    // Master Clock Synchronization (Robot 1)
+    if (Config::ID == 1) {
+        uint64_t curUs = micros();
+        if (curUs - frameStartUs >= TDMA_FRAME_US) {
+            frameStartUs = curUs;
+            globalFrameId = globalFrameId + 1;
 
-    // Initialize Heading Kalman Filter with identified covariances
-    kf.init(0.0f, Config::GYRO_BIAS_Z_RAD_S, Config::Q_YAW_DISCRETE, Config::Q_GYRO_BIAS_WALK, Config::R_YAW_ENCODER);
-
-    SPI_SD.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-    pinMode(PIN_SD_CS, OUTPUT);
-    digitalWrite(PIN_SD_CS, HIGH);
-    delay(50);
-
-    if (SD.begin(PIN_SD_CS, SPI_SD, 10000000)) {
-        sdCardReady = true;
-        char filename[32];
-        snprintf(filename, sizeof(filename), "/square_1m_r%d.csv", Config::ID);
-        logFile = SD.open(filename, FILE_WRITE);
-        if (logFile) {
-            logFile.println("timestamp_us,elapsed_ms,state,pos_x_m,pos_y_m,yaw_deg,bias_dps,raw_gz_dps,rpm_l,rpm_r,pwm_l,pwm_r,steps_l,steps_r,vbus_v,current_ma,slip");
-            logFile.flush();
+            SyncBeaconPacket sync = {globalFrameId, nowMs};
+            esp_now_send(BROADCAST_MAC, (uint8_t*)&sync, sizeof(SyncBeaconPacket));
+            isFrameSynced = true;
         }
     }
 
-    sdLogQueue = xQueueCreate(256, sizeof(SquareBenchmarkRecord));
-    xTaskCreatePinnedToCore(core0LoggerTask, "SDLogger", 4096, nullptr, 1, &core0TaskHandle, 0);
-
-    Serial.println("======================================================================");
-    Serial.printf("   ANJOMAN 1x1 METER SQUARE MANEUVER BENCHMARK (ROBOT %d)\n", Config::ID);
-    Serial.printf("   Calibrated R_eff: %.4f m | Decoupled W_eff: %.4f m\n", R_EFF_M, W_EFF_M);
-    Serial.printf("   Target: 4 Legs of 1.000m (%d ticks) + 4 In-Place 90-deg CCW Turns\n", LEG_TARGET_TICKS);
-    Serial.printf("   MicroSD File: /square_1m_r%d.csv | Status: %s\n", Config::ID, sdCardReady ? "READY" : "FAILED");
-    Serial.println("======================================================================");
-}
-
-void loop() {
-    static uint32_t startTestTimeMs = millis();
-    static uint64_t nextSampleUs = micros();
-    static bool testComplete = false;
-
-    // Maneuver State Machine:
-    // 0: ZUPT (3s)
-    // 1: Leg 1 (Straight +Y, 1m)   | 11: Turn 1 (Spin to 90 deg)
-    // 2: Leg 2 (Straight -X, 1m)   | 12: Turn 2 (Spin to 180 deg)
-    // 3: Leg 3 (Straight -Y, 1m)   | 13: Turn 3 (Spin to 270 deg)
-    // 4: Leg 4 (Straight +X, 1m)   | 14: Turn 4 (Spin to 360/0 deg)
-    // 99: Complete
-    static uint8_t  state = 0;
-    static uint32_t stateStartTimeMs = 0;
-    static int32_t  legStartStepsL = 0;
-    static int32_t  legStartStepsR = 0;
-    static float    targetHeadingDeg = 0.0f;
-
-    static float gyroBiasSum = 0.0f;
-    static uint32_t zuptCount = 0;
-
-    static int32_t prevStepsL = 0;
-    static int32_t prevStepsR = 0;
-
-    if (testComplete) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    if (!isFrameSynced) {
+        performRangingListenSafe();
+        yield();
         return;
     }
 
-    uint64_t nowUs = micros();
-    uint32_t elapsedMs = millis() - startTestTimeMs;
+    uint32_t slotUs = (uint32_t)(micros() - frameStartUs);
 
-    if (nowUs >= nextSampleUs) {
-        nextSampleUs = nowUs + SAMPLE_PERIOD_US;
-
-        // 1. Hardware Sensing
-        encL.update(CONTROL_PERIOD_S);
-        encR.update(CONTROL_PERIOD_S);
-
-        imu.readSensorData();
-        float gz_raw_dps = imu.getGyroZ();
-        float gz_raw_rad_s = gz_raw_dps * (PI / 180.0f);
-
-        float vbus_V = 7.40f;
-        float current_mA = 0.0f;
-        readINA226(vbus_V, current_mA);
-        if (vbus_V < 6.0f) vbus_V = 7.40f;
-
-        int32_t stepsL = encL.getCumulativeSteps();
-        int32_t stepsR = encR.getCumulativeSteps();
-
-        int32_t dStepsL = stepsL - prevStepsL;
-        int32_t dStepsR = stepsR - prevStepsR;
-        prevStepsL = stepsL;
-        prevStepsR = stepsR;
-
-        float ds_l = ((float)dStepsL / Config::ENCODER_CPR) * (2.0f * PI * R_EFF_M);
-        float ds_r = ((float)dStepsR / Config::ENCODER_CPR) * (2.0f * PI * R_EFF_M);
-        float ds_mid = (ds_r + ds_l) * 0.5f;
-        float delta_theta_wheel = (ds_r - ds_l) / W_EFF_M;
-
-        // 2. Kalman Filter Heading Estimation (100 Hz)
-        kf.predict(gz_raw_rad_s, CONTROL_PERIOD_S);
-        bool slip = !kf.updateEncoder(delta_theta_wheel, gz_raw_rad_s, CONTROL_PERIOD_S);
-
-        float currentHeadingRad = kf.getHeadingRad();
-        float currentHeadingDeg = kf.getHeadingDeg();
-
-        // 3. Cartesian Dead Reckoning Position Update (Forward = +Y, Right = +X, Left = -X)
-        // With standard CCW rotation (+theta turns left towards -X):
-        posX_m += ds_mid * (-sinf(currentHeadingRad));
-        posY_m += ds_mid * cosf(currentHeadingRad);
-
-        float targetRpmL = 0.0f;
-        float targetRpmR = 0.0f;
-        float dutyL = 0.0f;
-        float dutyR = 0.0f;
-
-        // 4. Square Maneuver State Machine
-        if (state == 0) {
-            // ZUPT: Pre-mission static calibration (0 to 3000 ms)
-            motorL.brake();
-            motorR.brake();
-            gyroBiasSum += gz_raw_rad_s;
-            zuptCount++;
-
-            if (elapsedMs >= 3000) {
-                if (zuptCount > 100) {
-                    float measuredBias = gyroBiasSum / (float)zuptCount;
-                    kf.init(0.0f, measuredBias, Config::Q_YAW_DISCRETE, Config::Q_GYRO_BIAS_WALK, Config::R_YAW_ENCODER);
-                }
-                state = 1; // Transition to Leg 1
-                stateStartTimeMs = millis();
-                legStartStepsL = stepsL;
-                legStartStepsR = stepsR;
-                rgbLedWrite(PIN_STATUS_RGB, 0, 0, 50); // Blue (Driving Straight)
+    // --------------------------------------------------------------------------
+    // SLOT 1 (10 to 30 ms): Link (1 -> 2)
+    // --------------------------------------------------------------------------
+    if (slotUs >= 15000 && slotUs < 30000) {
+        if (Config::ID == 1) {
+            static uint32_t lastPoll1 = 0;
+            if (lastPoll1 != globalFrameId) {
+                lastPoll1 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(2, rec);
+                fleetTelemetry[0] = rec;
             }
+        } else {
+            performRangingListenSafe();
         }
-        // Straight Driving Legs (1, 2, 3, 4)
-        else if (state >= 1 && state <= 4) {
-            targetRpmL = CRUISE_RPM;
-            targetRpmR = CRUISE_RPM;
-
-            int32_t legStepsL = stepsL - legStartStepsL;
-            int32_t legStepsR = stepsR - legStartStepsR;
-            int32_t avgLegTicks = (legStepsL + legStepsR) / 2;
-
-            // Cross-Coupled Tick Sync to maintain strict straightness
-            int32_t tickError = legStepsL - legStepsR;
-            float syncCorrection = constrain((float)tickError * 0.00015f, -0.08f, 0.08f);
-
-            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, -syncCorrection);
-            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, +syncCorrection);
-
-            // Transition: Exactly 1.000m reached
-            if (avgLegTicks >= LEG_TARGET_TICKS || (millis() - stateStartTimeMs) >= 12000) {
-                state += 10; // State 1 -> 11, 2 -> 12, etc.
-                targetHeadingDeg += 90.0f; // Target next corner
-                stateStartTimeMs = millis();
-                motorL.brake();
-                motorR.brake();
-                rgbLedWrite(PIN_STATUS_RGB, 40, 0, 40); // Magenta (In-Place Turn)
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 2 (30 to 50 ms): Link (1 -> 3)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 30000 && slotUs < 50000) {
+        if (Config::ID == 1) {
+            static uint32_t lastPoll2 = 0;
+            if (lastPoll2 != globalFrameId) {
+                lastPoll2 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(3, rec);
+                fleetTelemetry[1] = rec;
             }
+        } else {
+            performRangingListenSafe();
         }
-        // In-Place 90-Degree Closed-Loop Turns (11, 12, 13, 14)
-        else if (state >= 11 && state <= 14) {
-            // Turn CCW (+yaw)
-            targetRpmL = -TURN_RPM;
-            targetRpmR = +TURN_RPM;
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 3 (50 to 70 ms): Link (1 -> 4)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 50000 && slotUs < 70000) {
+        if (Config::ID == 1) {
+            static uint32_t lastPoll3 = 0;
+            if (lastPoll3 != globalFrameId) {
+                lastPoll3 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(4, rec);
+                fleetTelemetry[2] = rec;
+            }
+        } else {
+            performRangingListenSafe();
+        }
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 4 (70 to 90 ms): Link (2 -> 3)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 70000 && slotUs < 90000) {
+        if (Config::ID == 2) {
+            static uint32_t lastPoll4 = 0;
+            if (lastPoll4 != globalFrameId) {
+                lastPoll4 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(3, rec);
+                fleetTelemetry[3] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+            }
+        } else {
+            performRangingListenSafe();
+        }
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 5 (90 to 110 ms): Link (2 -> 4)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 90000 && slotUs < 110000) {
+        if (Config::ID == 2) {
+            static uint32_t lastPoll5 = 0;
+            if (lastPoll5 != globalFrameId) {
+                lastPoll5 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(4, rec);
+                fleetTelemetry[4] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+            }
+        } else {
+            performRangingListenSafe();
+        }
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 6 (110 to 130 ms): Link (3 -> 4)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 110000 && slotUs < 130000) {
+        if (Config::ID == 3) {
+            static uint32_t lastPoll6 = 0;
+            if (lastPoll6 != globalFrameId) {
+                lastPoll6 = globalFrameId;
+                FullEdgeTelemetry rec;
+                performRangingPoll(4, rec);
+                fleetTelemetry[5] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+            }
+        } else {
+            performRangingListenSafe();
+        }
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 7 (140 to 180 ms): Gateway Streaming (Robot 1)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 140000 && slotUs < 180000) {
+        if (Config::ID == 1) {
+            static uint32_t lastPrintedFrame = 0;
+            if (globalFrameId != lastPrintedFrame) {
+                lastPrintedFrame = globalFrameId;
 
-            dutyL = motorL.computeVelocityControl(targetRpmL, encL.getRPM(), vbus_V, CONTROL_PERIOD_S, 0.0f);
-            dutyR = motorR.computeVelocityControl(targetRpmR, encR.getRPM(), vbus_V, CONTROL_PERIOD_S, 0.0f);
-
-            // Threshold: Stop precisely when Kalman Filter Heading reaches target
-            if (currentHeadingDeg >= (targetHeadingDeg - 1.0f) || (millis() - stateStartTimeMs) >= 8000) {
-                motorL.brake();
-                motorR.brake();
-
-                if (state == 14) {
-                    // All 4 legs and 4 turns complete!
-                    state = 99;
-                    testComplete = true;
-
-                    vTaskDelay(pdMS_TO_TICKS(150));
-                    if (logFile) {
-                        logFile.flush();
-                        logFile.close();
-                    }
-
-                    rgbLedWrite(PIN_STATUS_RGB, 0, 60, 0); // Solid Green (Mission Complete)
-
-                    Serial.println("\n======================================================================");
-                    Serial.printf("[MISSION COMPLETE] 1x1m Square Finished for Robot %d\n", Config::ID);
-                    Serial.printf("   Calculated Final Position: X = %.4f m, Y = %.4f m\n", posX_m, posY_m);
-                    Serial.printf("   Filtered Final Yaw: %.2f deg (Nominal: 360.00 deg)\n", currentHeadingDeg);
-                    Serial.printf("   Estimated Final Gyro Bias: %.4f deg/s\n", kf.getBiasDegS());
-                    Serial.printf("   Return-to-Origin Distance Error: %.1f mm\n", sqrtf(posX_m*posX_m + posY_m*posY_m) * 1000.0f);
-                    Serial.println("   --> Measure actual physical position from the start line on the floor!");
-                    Serial.println("======================================================================");
-                } else {
-                    // Transition to next straight leg
-                    state = (state - 10) + 1;
-                    stateStartTimeMs = millis();
-                    legStartStepsL = stepsL;
-                    legStartStepsR = stepsR;
-                    rgbLedWrite(PIN_STATUS_RGB, 0, 0, 50); // Blue
+                for (uint8_t i = 0; i < 6; i++) {
+                    FullEdgeTelemetry &e = fleetTelemetry[i];
+                    Serial.printf("%lu,%lu,%u,%u,%u,%ld,%.2f,%lld,%lld,%.4f,%.4f,%.4f,%.4f,%.2f,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f\n",
+                                  (unsigned long)nowMs, (unsigned long)globalFrameId,
+                                  e.initiatorId, e.responderId,
+                                  e.status,
+                                  (long)e.carrierIntegrator,
+                                  e.cfoPpm,
+                                  (long long)e.tofUncompTicks,
+                                  (long long)e.tofCompTicks,
+                                  e.distUncompM,
+                                  e.distClockCompM,
+                                  e.distRssiCompM,
+                                  e.distCalibM,
+                                  e.rssi_dbm,
+                                  (unsigned long long)e.tTx1, (unsigned long long)e.tRx1,
+                                  (unsigned long long)e.tRx2, (unsigned long long)e.tTx2,
+                                  e.tempUwbInit, e.tempUwbResp,
+                                  e.tempEspInit, e.tempEspResp);
                 }
             }
         }
-
-        // 5. Stream Real-Time Telemetry to Core 0 Async Queue
-        SquareBenchmarkRecord rec = {};
-        rec.timestamp_us = nowUs;
-        rec.elapsed_ms = elapsedMs;
-        rec.state = state;
-        rec.pos_x_m = posX_m;
-        rec.pos_y_m = posY_m;
-        rec.filtered_yaw_deg = currentHeadingDeg;
-        rec.filtered_bias_dps = kf.getBiasDegS();
-        rec.raw_gyro_z_dps = gz_raw_dps;
-        rec.meas_rpm_l = encL.getRPM();
-        rec.meas_rpm_r = encR.getRPM();
-        rec.pwm_duty_l = dutyL;
-        rec.pwm_duty_r = dutyR;
-        rec.steps_l = stepsL;
-        rec.steps_r = stepsR;
-        rec.vbus_v = vbus_V;
-        rec.current_ma = current_mA;
-        rec.slip_detected = slip ? 1 : 0;
-
-        if (sdLogQueue != nullptr) {
-            xQueueSend(sdLogQueue, &rec, 0);
+        inRxMode = false;
+    }
+    // --------------------------------------------------------------------------
+    // SLOT 8 (185 to 195 ms): Periodic Temperature Sampling (Outside RF Windows)
+    // --------------------------------------------------------------------------
+    else if (slotUs >= 185000 && slotUs < 195000) {
+        static uint32_t lastTempUpdateMs = 0;
+        if (nowMs - lastTempUpdateMs >= 500) {
+            lastTempUpdateMs = nowMs;
+            float t_raw = DW1000Ng::getTemperature();
+            cachedTempEsp = temperatureRead();
+            if (t_raw > -30.0f && t_raw < 90.0f) {
+                cachedTempUwb = t_raw;
+            } else {
+                cachedTempUwb = cachedTempEsp - 1.5f;
+            }
         }
+        if (Config::ID != 1) performRangingListenSafe();
+    } else {
+        if (Config::ID != 1) performRangingListenSafe();
     }
     yield();
 }

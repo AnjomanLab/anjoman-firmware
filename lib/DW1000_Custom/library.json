@@ -1,0 +1,7 @@
+{
+  "name": "DW1000_Custom",
+  "version": "1.0.0",
+  "description": "Custom Decawave DW1000 driver with carrier integrator clock-offset compensation for Anjoman Swarm",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

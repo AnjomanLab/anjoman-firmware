@@ -30,12 +30,21 @@ constexpr uint8_t PIN_I2C1_SDA           = PIN_I2C0_SDA;
 constexpr uint8_t PIN_I2C1_SCL           = PIN_I2C0_SCL;
 
 // ==============================================================================
-// 2. DEDICATED SPI2 BUS (Decawave DW1000 UWB Transceiver ONLY - ALL ROBOTS)
+// 2. DEDICATED SPI2 BUS (Decawave DW1000 UWB Transceiver ONLY)
 // ==============================================================================
-constexpr uint8_t PIN_UWB_MOSI           = 41;
-constexpr uint8_t PIN_UWB_MISO           = 40;
-constexpr uint8_t PIN_UWB_SCK            = 39;
-constexpr uint8_t PIN_UWB_CS             = 38;
+
+#if ROBOT_ID == 2
+    constexpr uint8_t PIN_UWB_MOSI       = 11;
+    constexpr uint8_t PIN_UWB_SCK        = 12;
+    constexpr uint8_t PIN_UWB_MISO       = 13;
+    constexpr uint8_t PIN_UWB_CS         = 14;
+#else
+    constexpr uint8_t PIN_UWB_MOSI       = 41;
+    constexpr uint8_t PIN_UWB_SCK        = 39;
+    constexpr uint8_t PIN_UWB_MISO       = 40;
+    constexpr uint8_t PIN_UWB_CS         = 38;
+#endif
+
 constexpr uint8_t PIN_UWB_RST            = 10;
 constexpr uint8_t PIN_UWB_IRQ            = 5;
 
