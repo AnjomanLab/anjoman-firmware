@@ -6,12 +6,12 @@
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
 #include <DW1000NgRanging.hpp>
+
 #include "PinMap.h"
 #include "RobotConfig.h"
 
-
 // ==============================================================================
-// 1. HARDWARE CONSTANTS & DIRECT REGISTER DEFINITIONS
+// 1. HARDWARE CONSTANTS
 // ==============================================================================
 constexpr double   SPEED_OF_LIGHT         = 299792458.0;
 constexpr double   TIME_UNIT_SEC          = 0.000000000015650040064103;
@@ -19,19 +19,13 @@ constexpr double   TIME_UNIT_SEC          = 0.000000000015650040064103;
 // Verified hardware reply delay for all robots: exactly 2.5 ms (159,744,000 ticks)
 constexpr uint64_t SCHEDULED_REPLY_DELAY  = 159744000ULL; 
 
-// Deterministic 200 ms TDMA Frame (5 Hz full mesh update rate)
+// Deterministic 200 ms TDMA Frame (5 Hz update rate)
 constexpr uint32_t TDMA_FRAME_US          = 200000; 
 constexpr uint32_t PREFLIGHT_TIMEOUT_MS   = 4000;
 
 // Official Decawave Carrier Integrator conversion constants (Channel 5, N=1024)
 constexpr double   FREQ_OFFSET_MULTIPLIER         = 998.4e6 / (2.0 * 1024.0 * 131072.0); // ~3.71933 Hz/count
 constexpr double   HERTZ_TO_PPM_MULTIPLIER_CHAN_5 = -1.0e6 / 6489.6e6;                   // ~-1.5409e-4 ppm/Hz
-
-// Direct DW1000 Register Addresses for Deep Metrology
-constexpr uint8_t  REG_SYS_STATUS         = 0x0F;
-constexpr uint8_t  REG_RX_FINFO           = 0x10;
-constexpr uint8_t  REG_RX_FQUAL           = 0x12;
-constexpr uint8_t  REG_RX_TIME            = 0x15;
 
 uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -74,25 +68,18 @@ struct SyncBeaconPacket {
     uint32_t timestampMs;
 };
 
-// Comprehensive 30-Parameter Pure Uncalibrated Metrology Record
 struct RawEdgeTelemetry {
     uint32_t timestampMs;
     uint32_t frameId;
     uint8_t  initiatorId;
     uint8_t  responderId;
     uint8_t  status;              // 1 = Success, 0 = Timeout/Loss
-    
-    // Core ToF & Physical Propagation
     int64_t  tofRawTicks;
     int64_t  tofCompTicks;
-    float    distRawM;            // Pure raw (ToF * c) - ZERO calibration/offset
-    float    distCfoM;            // CFO clock-offset compensated - ZERO calibration/offset
-    
-    // Frequency & Clock Integrator
+    float    distRawM;            // Pure raw (ToF * c) - ZERO offset
+    float    distCfoM;            // CFO clock-compensated - ZERO offset
     int32_t  carrierIntegrator;
     float    cfoPpm;
-    
-    // Signal Quality & RF Diagnostics
     float    rssiDbm;
     float    fpPowerDbm;
     float    rxQuality;
@@ -102,17 +89,13 @@ struct RawEdgeTelemetry {
     uint16_t fpAmpl3;
     uint16_t cirPwr;
     uint16_t rxpacc;
-    uint8_t  ldeError;            // 1 if LDE error flag asserted, 0 otherwise
-    
-    // Voltages & Thermal States
+    uint8_t  ldeError;
     float    vbatUwbInit;
     float    vbatUwbResp;
     float    tempUwbInit;
     float    tempUwbResp;
     float    tempEspInit;
     float    tempEspResp;
-
-    // 40-bit Raw Hardware Timestamps
     uint64_t tTx1;
     uint64_t tRx1;
     uint64_t tRx2;
@@ -145,10 +128,8 @@ float cachedTempUwb = 25.0f;
 float cachedTempEsp = 25.0f;
 float cachedVbatUwb = 3.3f;
 
-RawEdgeTelemetry fleetTelemetry[6]; // Full mesh: (1,2), (1,3), (1,4), (2,3), (2,4), (3,4)
-
 // ==============================================================================
-// 2. ESP-NOW MESH NETWORKING
+// 2. ESP-NOW TDMA TIME SYNCHRONIZATION ONLY (NO TELEMETRY SHARING)
 // ==============================================================================
 void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len) {
     if (data_len == sizeof(SyncBeaconPacket)) {
@@ -157,21 +138,6 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int d
         globalFrameId = pkt.frameId;
         frameStartUs = micros();
         isFrameSynced = true;
-    } else if (data_len == sizeof(RawEdgeTelemetry)) {
-        RawEdgeTelemetry edge;
-        memcpy(&edge, data, sizeof(RawEdgeTelemetry));
-        
-        uint8_t idx = 0xFF;
-        if (edge.initiatorId == 1 && edge.responderId == 2) idx = 0;
-        else if (edge.initiatorId == 1 && edge.responderId == 3) idx = 1;
-        else if (edge.initiatorId == 1 && edge.responderId == 4) idx = 2;
-        else if (edge.initiatorId == 2 && edge.responderId == 3) idx = 3;
-        else if (edge.initiatorId == 2 && edge.responderId == 4) idx = 4;
-        else if (edge.initiatorId == 3 && edge.responderId == 4) idx = 5;
-
-        if (idx != 0xFF) {
-            fleetTelemetry[idx] = edge;
-        }
     }
 }
 
@@ -225,14 +191,50 @@ void setupUWB() {
 }
 
 // ==============================================================================
-// 4. METROLOGY ENGINE WITH REGISTER EXTRACTION (ZERO CALIBRATION)
+// 4. PRINT HELPER (IMMEDIATE DIRECT SERIAL STREAMING)
+// ==============================================================================
+void printTelemetry(const RawEdgeTelemetry &e) {
+    Serial.printf("%lu,%lu,%u,%u,%u,%lld,%lld,%.4f,%.4f,%ld,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%u,%u,%u,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%llu,%llu,%llu,%llu\n",
+                  (unsigned long)e.timestampMs, (unsigned long)e.frameId,
+                  e.initiatorId, e.responderId,
+                  e.status,
+                  (long long)e.tofRawTicks,
+                  (long long)e.tofCompTicks,
+                  e.distRawM,
+                  e.distCfoM,
+                  (long)e.carrierIntegrator,
+                  e.cfoPpm,
+                  e.rssiDbm,
+                  e.fpPowerDbm,
+                  e.rxQuality,
+                  e.stdNoise,
+                  e.fpAmpl1,
+                  e.fpAmpl2,
+                  e.fpAmpl3,
+                  e.cirPwr,
+                  e.rxpacc,
+                  e.ldeError,
+                  e.vbatUwbInit,
+                  e.vbatUwbResp,
+                  e.tempUwbInit,
+                  e.tempUwbResp,
+                  e.tempEspInit,
+                  e.tempEspResp,
+                  (unsigned long long)e.tTx1,
+                  (unsigned long long)e.tRx1,
+                  (unsigned long long)e.tRx2,
+                  (unsigned long long)e.tTx2);
+}
+
+// ==============================================================================
+// 5. METROLOGY ENGINE (DIRECT HARDWARE MEASUREMENT)
 // ==============================================================================
 bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
     rec.timestampMs       = millis();
     rec.frameId           = globalFrameId;
     rec.initiatorId       = Config::ID;
     rec.responderId       = targetPeerId;
-    rec.status            = 0; // Default fail
+    rec.status            = 0;
     rec.tofRawTicks       = 0;
     rec.tofCompTicks      = 0;
     rec.distRawM          = 0.0f;
@@ -274,6 +276,7 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
     while (!DW1000Ng::isTransmitDone()) {
         if (millis() - txStart > 6) {
             inRxMode = false;
+            printTelemetry(rec);
             return false;
         }
         yield();
@@ -281,13 +284,13 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
     DW1000Ng::clearTransmitStatus();
     uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
-    // Await Response with 10 ms window
+    // Await Response with 8 ms window
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
     inRxMode = true;
     uint32_t waitRx = millis();
     bool success = false;
 
-    while (millis() - waitRx < 10) {
+    while (millis() - waitRx < 8) {
         if (DW1000Ng::isReceiveDone()) {
             DW1000Ng::clearReceiveStatus();
 
@@ -300,27 +303,16 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
                     respPkt.responderId == targetPeerId &&
                     respPkt.targetId == Config::ID) {
 
-                    // 1. Timestamps Capture
                     uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
                     uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
                     uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
 
-                    // 2. Hardware Diagnostics & Register Dumps via Driver
                     auto diag = DW1000Ng::getChannelDiagnostics();
-                    uint8_t  ldeErr   = diag.ldeError;
-                    uint16_t stdNoise = diag.stdNoise;
-                    uint16_t fpAmpl1  = diag.fpAmpl1;
-                    uint16_t fpAmpl2  = diag.fpAmpl2;
-                    uint16_t fpAmpl3  = diag.fpAmpl3;
-                    uint16_t cirPwr   = diag.cirPwr;
-                    uint16_t rxpacc   = diag.rxpacc;
 
-                    // 3. Carrier Integrator & CFO
                     int32_t ci = DW1000Ng::getCarrierIntegrator();
                     double cfoPpm = (double)ci * FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5;
                     double clockOffsetRatio = cfoPpm * 1.0e-6;
 
-                    // 4. Raw ToF & Uncalibrated Distances
                     int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
                     int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
 
@@ -331,7 +323,6 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
                     double tofCompTicks = ((double)tRound - tReplyComp) / 2.0;
                     double distCfo = tofCompTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
 
-                    // 5. Populate Telemetry Record
                     rec.status            = 1;
                     rec.tofRawTicks       = tofRawTicks;
                     rec.tofCompTicks      = (int64_t)tofCompTicks;
@@ -342,13 +333,13 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
                     rec.rssiDbm           = (float)DW1000Ng::getReceivePower();
                     rec.fpPowerDbm        = (float)DW1000Ng::getFirstPathPower();
                     rec.rxQuality         = DW1000Ng::getReceiveQuality();
-                    rec.stdNoise          = stdNoise;
-                    rec.fpAmpl1           = fpAmpl1;
-                    rec.fpAmpl2           = fpAmpl2;
-                    rec.fpAmpl3           = fpAmpl3;
-                    rec.cirPwr            = cirPwr;
-                    rec.rxpacc            = rxpacc;
-                    rec.ldeError          = ldeErr;
+                    rec.stdNoise          = diag.stdNoise;
+                    rec.fpAmpl1           = diag.fpAmpl1;
+                    rec.fpAmpl2           = diag.fpAmpl2;
+                    rec.fpAmpl3           = diag.fpAmpl3;
+                    rec.cirPwr            = diag.cirPwr;
+                    rec.rxpacc            = diag.rxpacc;
+                    rec.ldeError          = diag.ldeError;
                     rec.vbatUwbResp       = respPkt.vbatUwb;
                     rec.tempUwbResp       = respPkt.tempUwb;
                     rec.tempEspResp       = respPkt.tempEsp;
@@ -367,6 +358,7 @@ bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
 
     DW1000Ng::forceTRxOff();
     inRxMode = false;
+    printTelemetry(rec);
     return success;
 }
 
@@ -438,83 +430,39 @@ void performRangingListenSafe() {
 }
 
 // ==============================================================================
-// 5. PRE-FLIGHT SANITY CHECK (PST)
-// ==============================================================================
-bool runPreflightSanityCheck() {
-    Serial.printf("# [ROBOT %u] Pre-Flight Link Sanity Check...\n", Config::ID);
-    uint32_t pstStart = millis();
-    bool peerOk[4] = {false, false, false, false};
-
-    while (millis() - pstStart < PREFLIGHT_TIMEOUT_MS) {
-        if (Config::ID == 1) {
-            for (uint8_t target = 2; target <= 4; target++) {
-                RawEdgeTelemetry dummy;
-                if (performRangingPoll(target, dummy)) {
-                    peerOk[target - 1] = true;
-                }
-                delay(15);
-            }
-            if (peerOk[1] && peerOk[2] && peerOk[3]) break;
-        } else {
-            performRangingListenSafe();
-        }
-        yield();
-    }
-
-    if (Config::ID == 1) {
-        bool allOk = (peerOk[1] && peerOk[2] && peerOk[3]);
-        if (allOk) {
-            Serial.println("# [PST SUCCESS] Peers (R2, R3, R4) active!");
-            return true;
-        } else {
-            Serial.printf("# [PST WARNING] Status: R2:%d R3:%d R4:%d\n", peerOk[1], peerOk[2], peerOk[3]);
-            return false;
-        }
-    }
-    return true;
-}
-
-// ==============================================================================
 // 6. SETUP
 // ==============================================================================
 void setup() {
     Serial.begin(460800);
     delay(1000);
 
-    // Active electrical braking for safe static stance
+    // Motors completely disabled (Coast mode)
     pinMode(PIN_MOTOR_L_IN1, OUTPUT); pinMode(PIN_MOTOR_L_IN2, OUTPUT);
     pinMode(PIN_MOTOR_R_IN1, OUTPUT); pinMode(PIN_MOTOR_R_IN2, OUTPUT);
-    digitalWrite(PIN_MOTOR_L_IN1, HIGH); digitalWrite(PIN_MOTOR_L_IN2, HIGH);
-    digitalWrite(PIN_MOTOR_R_IN1, HIGH); digitalWrite(PIN_MOTOR_R_IN2, HIGH);
+    digitalWrite(PIN_MOTOR_L_IN1, LOW); digitalWrite(PIN_MOTOR_L_IN2, LOW);
+    digitalWrite(PIN_MOTOR_R_IN1, LOW); digitalWrite(PIN_MOTOR_R_IN2, LOW);
 
     setupESPNow();
     setupUWB();
 
-    // Initial sensor capture
     float t_raw = DW1000Ng::getTemperature();
     cachedTempEsp = temperatureRead();
     if (t_raw > -30.0f && t_raw < 90.0f) cachedTempUwb = t_raw;
     else cachedTempUwb = cachedTempEsp - 1.5f;
     cachedVbatUwb = DW1000Ng::getBatteryVoltage();
 
-    bool pstPassed = runPreflightSanityCheck();
-    if (!pstPassed && Config::ID == 1) {
-        rgbLedWrite(PIN_STATUS_RGB, 60, 0, 0); // Red on warning
-    } else {
-        rgbLedWrite(PIN_STATUS_RGB, 0, 0, 40); // Blue (Active)
-    }
+    rgbLedWrite(PIN_STATUS_RGB, 0, 0, 0); // Keep LED completely off
 
-    // Comprehensive 30-Column CSV Header for Deep Metrology
     Serial.println("timestamp_ms,frame_id,init_id,resp_id,status,tof_raw,tof_comp,dist_raw_m,dist_cfo_m,carrier_int,cfo_ppm,rssi_dbm,fp_power_dbm,rx_quality,std_noise,fp_ampl1,fp_ampl2,fp_ampl3,cir_pwr,rxpacc,lde_error,vbat_init,vbat_resp,temp_uwb_init,temp_uwb_resp,temp_esp_init,temp_esp_resp,tTx1,tRx1,tRx2,tTx2");
 }
 
 // ==============================================================================
-// 7. DETERMINISTIC 200 ms TDMA LOOP (20 ms DEDICATED SLOTS)
+// 7. DETERMINISTIC 200 ms SYMMETRIC TDMA LOOP (12 SLOTS x 15 ms)
 // ==============================================================================
 void loop() {
     uint32_t nowMs = millis();
 
-    // Robot 1 acts as TDMA Time Beacon Generator
+    // Robot 1 generates deterministic time beacons
     if (Config::ID == 1) {
         uint64_t curUs = micros();
         if (curUs - frameStartUs >= TDMA_FRAME_US) {
@@ -535,158 +483,100 @@ void loop() {
 
     uint32_t slotUs = (uint32_t)(micros() - frameStartUs);
 
-    // --------------------------------------------------------------------------
-    // SLOT 1 (15 to 30 ms): Link (1 -> 2)
-    // --------------------------------------------------------------------------
+    // --- ROBOT 1 SLOTS (15 ms each) ---
+    // Slot 1 (15 - 30 ms): Link (1 -> 2)
     if (slotUs >= 15000 && slotUs < 30000) {
         if (Config::ID == 1) {
-            static uint32_t lastPoll1 = 0;
-            if (lastPoll1 != globalFrameId) {
-                lastPoll1 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(2, rec);
-                fleetTelemetry[0] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(2, r); }
+        } else performRangingListenSafe();
     }
-    // --------------------------------------------------------------------------
-    // SLOT 2 (30 to 50 ms): Link (1 -> 3)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 30000 && slotUs < 50000) {
+    // Slot 2 (30 - 45 ms): Link (1 -> 3)
+    else if (slotUs >= 30000 && slotUs < 45000) {
         if (Config::ID == 1) {
-            static uint32_t lastPoll2 = 0;
-            if (lastPoll2 != globalFrameId) {
-                lastPoll2 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(3, rec);
-                fleetTelemetry[1] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(3, r); }
+        } else performRangingListenSafe();
     }
-    // --------------------------------------------------------------------------
-    // SLOT 3 (50 to 70 ms): Link (1 -> 4)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 50000 && slotUs < 70000) {
+    // Slot 3 (45 - 60 ms): Link (1 -> 4)
+    else if (slotUs >= 45000 && slotUs < 60000) {
         if (Config::ID == 1) {
-            static uint32_t lastPoll3 = 0;
-            if (lastPoll3 != globalFrameId) {
-                lastPoll3 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(4, rec);
-                fleetTelemetry[2] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(4, r); }
+        } else performRangingListenSafe();
     }
-    // --------------------------------------------------------------------------
-    // SLOT 4 (70 to 90 ms): Link (2 -> 3)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 70000 && slotUs < 90000) {
-        if (Config::ID == 2) {
-            static uint32_t lastPoll4 = 0;
-            if (lastPoll4 != globalFrameId) {
-                lastPoll4 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(3, rec);
-                fleetTelemetry[3] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
-    }
-    // --------------------------------------------------------------------------
-    // SLOT 5 (90 to 110 ms): Link (2 -> 4)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 90000 && slotUs < 110000) {
-        if (Config::ID == 2) {
-            static uint32_t lastPoll5 = 0;
-            if (lastPoll5 != globalFrameId) {
-                lastPoll5 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(4, rec);
-                fleetTelemetry[4] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
-    }
-    // --------------------------------------------------------------------------
-    // SLOT 6 (110 to 130 ms): Link (3 -> 4)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 110000 && slotUs < 130000) {
-        if (Config::ID == 3) {
-            static uint32_t lastPoll6 = 0;
-            if (lastPoll6 != globalFrameId) {
-                lastPoll6 = globalFrameId;
-                RawEdgeTelemetry rec;
-                performRangingPoll(4, rec);
-                fleetTelemetry[5] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
-            }
-        } else {
-            performRangingListenSafe();
-        }
-    }
-    // --------------------------------------------------------------------------
-    // SLOT 7 (140 to 180 ms): Full-Fleet Universal Serial Streaming (Any Robot)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 140000 && slotUs < 180000) {
-        static uint32_t lastPrintedFrame = 0;
-        if (globalFrameId != lastPrintedFrame) {
-            lastPrintedFrame = globalFrameId;
 
-            for (uint8_t i = 0; i < 6; i++) {
-                RawEdgeTelemetry &e = fleetTelemetry[i];
-                if (e.frameId == globalFrameId) {
-                    Serial.printf("%lu,%lu,%u,%u,%u,%lld,%lld,%.4f,%.4f,%ld,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%u,%u,%u,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%llu,%llu,%llu,%llu\n",
-                                  (unsigned long)nowMs, (unsigned long)globalFrameId,
-                                  e.initiatorId, e.responderId,
-                                  e.status,
-                                  (long long)e.tofRawTicks,
-                                  (long long)e.tofCompTicks,
-                                  e.distRawM,
-                                  e.distCfoM,
-                                  (long)e.carrierIntegrator,
-                                  e.cfoPpm,
-                                  e.rssiDbm,
-                                  e.fpPowerDbm,
-                                  e.rxQuality,
-                                  e.stdNoise,
-                                  e.fpAmpl1,
-                                  e.fpAmpl2,
-                                  e.fpAmpl3,
-                                  e.cirPwr,
-                                  e.rxpacc,
-                                  e.ldeError,
-                                  e.vbatUwbInit,
-                                  e.vbatUwbResp,
-                                  e.tempUwbInit,
-                                  e.tempUwbResp,
-                                  e.tempEspInit,
-                                  e.tempEspResp,
-                                  (unsigned long long)e.tTx1,
-                                  (unsigned long long)e.tRx1,
-                                  (unsigned long long)e.tRx2,
-                                  (unsigned long long)e.tTx2);
-                }
-            }
-        }
-        inRxMode = false;
+    // --- ROBOT 2 SLOTS ---
+    // Slot 4 (60 - 75 ms): Link (2 -> 1)
+    else if (slotUs >= 60000 && slotUs < 75000) {
+        if (Config::ID == 2) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(1, r); }
+        } else performRangingListenSafe();
     }
-    // --------------------------------------------------------------------------
-    // SLOT 8 (185 to 195 ms): Periodic Sensor Sampling (TRx Idle Window)
-    // --------------------------------------------------------------------------
-    else if (slotUs >= 185000 && slotUs < 195000) {
+    // Slot 5 (75 - 90 ms): Link (2 -> 3)
+    else if (slotUs >= 75000 && slotUs < 90000) {
+        if (Config::ID == 2) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(3, r); }
+        } else performRangingListenSafe();
+    }
+    // Slot 6 (90 - 105 ms): Link (2 -> 4)
+    else if (slotUs >= 90000 && slotUs < 105000) {
+        if (Config::ID == 2) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(4, r); }
+        } else performRangingListenSafe();
+    }
+
+    // --- ROBOT 3 SLOTS ---
+    // Slot 7 (105 - 120 ms): Link (3 -> 1)
+    else if (slotUs >= 105000 && slotUs < 120000) {
+        if (Config::ID == 3) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(1, r); }
+        } else performRangingListenSafe();
+    }
+    // Slot 8 (120 - 135 ms): Link (3 -> 2)
+    else if (slotUs >= 120000 && slotUs < 135000) {
+        if (Config::ID == 3) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(2, r); }
+        } else performRangingListenSafe();
+    }
+    // Slot 9 (135 - 150 ms): Link (3 -> 4)
+    else if (slotUs >= 135000 && slotUs < 150000) {
+        if (Config::ID == 3) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(4, r); }
+        } else performRangingListenSafe();
+    }
+
+    // --- ROBOT 4 SLOTS ---
+    // Slot 10 (150 - 165 ms): Link (4 -> 1)
+    else if (slotUs >= 150000 && slotUs < 165000) {
+        if (Config::ID == 4) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(1, r); }
+        } else performRangingListenSafe();
+    }
+    // Slot 11 (165 - 180 ms): Link (4 -> 2)
+    else if (slotUs >= 165000 && slotUs < 180000) {
+        if (Config::ID == 4) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(2, r); }
+        } else performRangingListenSafe();
+    }
+    // Slot 12 (180 - 195 ms): Link (4 -> 3)
+    else if (slotUs >= 180000 && slotUs < 195000) {
+        if (Config::ID == 4) {
+            static uint32_t lp = 0;
+            if (lp != globalFrameId) { lp = globalFrameId; RawEdgeTelemetry r; performRangingPoll(3, r); }
+        } else performRangingListenSafe();
+    }
+
+    // --- SENSOR SAMPLING (195 - 200 ms) ---
+    else if (slotUs >= 195000) {
         static uint32_t lastTempUpdateMs = 0;
         if (nowMs - lastTempUpdateMs >= 500) {
             lastTempUpdateMs = nowMs;
