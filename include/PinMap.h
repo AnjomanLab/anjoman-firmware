@@ -74,13 +74,22 @@ constexpr uint8_t PIN_UWB_IRQ            = 5;
     constexpr uint8_t PIN_VBAT_SENSE     = 4; // ADC1_CH3 on Robots 1, 3, 4
 #endif
 
+
 // ==============================================================================
-// 5. MOTOR DRIVE (DRV8833 Dual H-Bridge PWM - ALL ROBOTS)
+// 5. MOTOR DRIVE (DRV8833 Dual H-Bridge PWM)
 // ==============================================================================
-constexpr uint8_t PIN_MOTOR_L_IN1        = 15;
-constexpr uint8_t PIN_MOTOR_L_IN2        = 16;
-constexpr uint8_t PIN_MOTOR_R_IN1        = 17;
-constexpr uint8_t PIN_MOTOR_R_IN2        = 18;
+#if ROBOT_ID == 1
+    // Left motor relocated to avoid hardware failure on GPIO 15/16
+    constexpr uint8_t PIN_MOTOR_L_IN1        = 6;
+    constexpr uint8_t PIN_MOTOR_L_IN2        = 7;
+#else
+    // Standard left motor pins for Robots 2, 3, 4
+    constexpr uint8_t PIN_MOTOR_L_IN1        = 15;
+    constexpr uint8_t PIN_MOTOR_L_IN2        = 16;
+#endif
+
+constexpr uint8_t PIN_MOTOR_R_IN1            = 17;
+constexpr uint8_t PIN_MOTOR_R_IN2            = 18;
 
 // ==============================================================================
 // 6. SYSTEM INTERFACES & DIAGNOSTICS

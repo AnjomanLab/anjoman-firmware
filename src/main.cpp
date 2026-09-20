@@ -6,12 +6,12 @@
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
 #include <DW1000NgRanging.hpp>
-
 #include "PinMap.h"
 #include "RobotConfig.h"
 
+
 // ==============================================================================
-// 1. HARDWARE TIME CONSTANTS & PHYSICAL EQUATIONS
+// 1. HARDWARE CONSTANTS & DIRECT REGISTER DEFINITIONS
 // ==============================================================================
 constexpr double   SPEED_OF_LIGHT         = 299792458.0;
 constexpr double   TIME_UNIT_SEC          = 0.000000000015650040064103;
@@ -21,11 +21,17 @@ constexpr uint64_t SCHEDULED_REPLY_DELAY  = 159744000ULL;
 
 // Deterministic 200 ms TDMA Frame (5 Hz full mesh update rate)
 constexpr uint32_t TDMA_FRAME_US          = 200000; 
-constexpr uint32_t PREFLIGHT_TIMEOUT_MS   = 4000;   // 4-second initial link check
+constexpr uint32_t PREFLIGHT_TIMEOUT_MS   = 4000;
 
 // Official Decawave Carrier Integrator conversion constants (Channel 5, N=1024)
 constexpr double   FREQ_OFFSET_MULTIPLIER         = 998.4e6 / (2.0 * 1024.0 * 131072.0); // ~3.71933 Hz/count
 constexpr double   HERTZ_TO_PPM_MULTIPLIER_CHAN_5 = -1.0e6 / 6489.6e6;                   // ~-1.5409e-4 ppm/Hz
+
+// Direct DW1000 Register Addresses for Deep Metrology
+constexpr uint8_t  REG_SYS_STATUS         = 0x0F;
+constexpr uint8_t  REG_RX_FINFO           = 0x10;
+constexpr uint8_t  REG_RX_FQUAL           = 0x12;
+constexpr uint8_t  REG_RX_TIME            = 0x15;
 
 uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -58,8 +64,9 @@ struct UWBResponsePacket {
     uint32_t sequence;
     uint8_t  rxTimestamp[5]; // tRx2 (40-bit)
     uint8_t  txTimestamp[5]; // tTx2 (40-bit)
-    float    tempUwb;        // Cached DW1000 internal temp
+    float    tempUwb;        // Cached DW1000 temp
     float    tempEsp;        // Cached ESP32 temp
+    float    vbatUwb;        // Cached DW1000 internal voltage
 };
 
 struct SyncBeaconPacket {
@@ -67,30 +74,49 @@ struct SyncBeaconPacket {
     uint32_t timestampMs;
 };
 
-// 22-Parameter Pure Telemetry Record
-struct FullEdgeTelemetry {
+// Comprehensive 30-Parameter Pure Uncalibrated Metrology Record
+struct RawEdgeTelemetry {
     uint32_t timestampMs;
     uint32_t frameId;
     uint8_t  initiatorId;
     uint8_t  responderId;
-    uint8_t  status;         // 1 = Success, 0 = Timeout/Loss
+    uint8_t  status;              // 1 = Success, 0 = Timeout/Loss
+    
+    // Core ToF & Physical Propagation
+    int64_t  tofRawTicks;
+    int64_t  tofCompTicks;
+    float    distRawM;            // Pure raw (ToF * c) - ZERO calibration/offset
+    float    distCfoM;            // CFO clock-offset compensated - ZERO calibration/offset
+    
+    // Frequency & Clock Integrator
     int32_t  carrierIntegrator;
     float    cfoPpm;
-    int64_t  tofUncompTicks;
-    int64_t  tofCompTicks;
-    float    distUncompM;
-    float    distClockCompM;
-    float    distRssiCompM;
-    float    distCalibM;
-    float    rssi_dbm;
-    uint64_t tTx1;
-    uint64_t tRx1;
-    uint64_t tRx2;
-    uint64_t tTx2;
+    
+    // Signal Quality & RF Diagnostics
+    float    rssiDbm;
+    float    fpPowerDbm;
+    float    rxQuality;
+    uint16_t stdNoise;
+    uint16_t fpAmpl1;
+    uint16_t fpAmpl2;
+    uint16_t fpAmpl3;
+    uint16_t cirPwr;
+    uint16_t rxpacc;
+    uint8_t  ldeError;            // 1 if LDE error flag asserted, 0 otherwise
+    
+    // Voltages & Thermal States
+    float    vbatUwbInit;
+    float    vbatUwbResp;
     float    tempUwbInit;
     float    tempUwbResp;
     float    tempEspInit;
     float    tempEspResp;
+
+    // 40-bit Raw Hardware Timestamps
+    uint64_t tTx1;
+    uint64_t tRx1;
+    uint64_t tRx2;
+    uint64_t tTx2;
 };
 #pragma pack(pop)
 
@@ -117,8 +143,9 @@ bool inRxMode = false;
 
 float cachedTempUwb = 25.0f;
 float cachedTempEsp = 25.0f;
+float cachedVbatUwb = 3.3f;
 
-FullEdgeTelemetry fleetTelemetry[6]; // Storage for all 6 edges: (1,2), (1,3), (1,4), (2,3), (2,4), (3,4)
+RawEdgeTelemetry fleetTelemetry[6]; // Full mesh: (1,2), (1,3), (1,4), (2,3), (2,4), (3,4)
 
 // ==============================================================================
 // 2. ESP-NOW MESH NETWORKING
@@ -130,9 +157,9 @@ void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int d
         globalFrameId = pkt.frameId;
         frameStartUs = micros();
         isFrameSynced = true;
-    } else if (data_len == sizeof(FullEdgeTelemetry)) {
-        FullEdgeTelemetry edge;
-        memcpy(&edge, data, sizeof(FullEdgeTelemetry));
+    } else if (data_len == sizeof(RawEdgeTelemetry)) {
+        RawEdgeTelemetry edge;
+        memcpy(&edge, data, sizeof(RawEdgeTelemetry));
         
         uint8_t idx = 0xFF;
         if (edge.initiatorId == 1 && edge.responderId == 2) idx = 0;
@@ -198,28 +225,37 @@ void setupUWB() {
 }
 
 // ==============================================================================
-// 4. SS-TWR ENGINE WITH CARRIER-INTEGRATOR COMPENSATION
+// 4. METROLOGY ENGINE WITH REGISTER EXTRACTION (ZERO CALIBRATION)
 // ==============================================================================
-bool performRangingPoll(uint8_t targetPeerId, FullEdgeTelemetry &rec) {
+bool performRangingPoll(uint8_t targetPeerId, RawEdgeTelemetry &rec) {
     rec.timestampMs       = millis();
     rec.frameId           = globalFrameId;
     rec.initiatorId       = Config::ID;
     rec.responderId       = targetPeerId;
-    rec.status            = 0; // Failed by default
+    rec.status            = 0; // Default fail
+    rec.tofRawTicks       = 0;
+    rec.tofCompTicks      = 0;
+    rec.distRawM          = 0.0f;
+    rec.distCfoM          = 0.0f;
     rec.carrierIntegrator = 0;
     rec.cfoPpm            = 0.0f;
-    rec.tofUncompTicks    = 0;
-    rec.tofCompTicks      = 0;
-    rec.distUncompM       = 0.0f;
-    rec.distClockCompM    = 0.0f;
-    rec.distRssiCompM     = 0.0f;
-    rec.distCalibM        = 0.0f;
-    rec.rssi_dbm          = 0.0f;
-    rec.tTx1 = rec.tRx1 = rec.tRx2 = rec.tTx2 = 0;
+    rec.rssiDbm           = 0.0f;
+    rec.fpPowerDbm        = 0.0f;
+    rec.rxQuality         = 0.0f;
+    rec.stdNoise          = 0;
+    rec.fpAmpl1           = 0;
+    rec.fpAmpl2           = 0;
+    rec.fpAmpl3           = 0;
+    rec.cirPwr            = 0;
+    rec.rxpacc            = 0;
+    rec.ldeError          = 0;
+    rec.vbatUwbInit       = cachedVbatUwb;
+    rec.vbatUwbResp       = 0.0f;
     rec.tempUwbInit       = cachedTempUwb;
     rec.tempUwbResp       = 0.0f;
     rec.tempEspInit       = cachedTempEsp;
     rec.tempEspResp       = 0.0f;
+    rec.tTx1 = rec.tRx1 = rec.tRx2 = rec.tTx2 = 0;
 
     UWBPollPacket pollPkt = {};
     memcpy(pollPkt.header, "POLL", 4);
@@ -245,7 +281,7 @@ bool performRangingPoll(uint8_t targetPeerId, FullEdgeTelemetry &rec) {
     DW1000Ng::clearTransmitStatus();
     uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
-    // Await Response with generous 10 ms window
+    // Await Response with 10 ms window
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
     inRxMode = true;
     uint32_t waitRx = millis();
@@ -264,54 +300,62 @@ bool performRangingPoll(uint8_t targetPeerId, FullEdgeTelemetry &rec) {
                     respPkt.responderId == targetPeerId &&
                     respPkt.targetId == Config::ID) {
 
-                    // 1. Capture Timestamps
+                    // 1. Timestamps Capture
                     uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
                     uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
                     uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
 
-                    // 2. Read Raw Carrier Integrator ONCE
-                    int32_t ci = DW1000Ng::getCarrierIntegrator();
+                    // 2. Hardware Diagnostics & Register Dumps via Driver
+                    auto diag = DW1000Ng::getChannelDiagnostics();
+                    uint8_t  ldeErr   = diag.ldeError;
+                    uint16_t stdNoise = diag.stdNoise;
+                    uint16_t fpAmpl1  = diag.fpAmpl1;
+                    uint16_t fpAmpl2  = diag.fpAmpl2;
+                    uint16_t fpAmpl3  = diag.fpAmpl3;
+                    uint16_t cirPwr   = diag.cirPwr;
+                    uint16_t rxpacc   = diag.rxpacc;
 
-                    // 3. Compute Official Decawave CFO & Clock Offset Ratio
+                    // 3. Carrier Integrator & CFO
+                    int32_t ci = DW1000Ng::getCarrierIntegrator();
                     double cfoPpm = (double)ci * FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5;
                     double clockOffsetRatio = cfoPpm * 1.0e-6;
 
-                    // 4. Raw Durations
+                    // 4. Raw ToF & Uncalibrated Distances
                     int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
                     int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
 
-                    // A) Uncompensated Raw SS-TWR (Displays the legacy 20-40m bias)
-                    int64_t tofUncomp = (tRound - tReply) / 2;
-                    double distUncomp = (double)tofUncomp * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+                    int64_t tofRawTicks = (tRound - tReply) / 2;
+                    double distRaw = (double)tofRawTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
 
-                    // B) Clock-Offset Compensated SS-TWR (Official Decawave Formulation)
-                    double tReplyCorrected = (double)tReply * (1.0 + clockOffsetRatio);
-                    double tofComp = ((double)tRound - tReplyCorrected) / 2.0;
-                    double distClockComp = tofComp * TIME_UNIT_SEC * SPEED_OF_LIGHT;
+                    double tReplyComp = (double)tReply * (1.0 + clockOffsetRatio);
+                    double tofCompTicks = ((double)tRound - tReplyComp) / 2.0;
+                    double distCfo = tofCompTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT;
 
-                    // C) Decawave Internal RSSI Power Bias Correction Curve
-                    double distRssiComp = (double)DW1000NgRanging::correctRange((float)distClockComp);
-
-                    // D) Final Zero-Offset Calibration
-                    double distCalib = Config::getCalibratedDistance(Config::ID, targetPeerId, (float)distRssiComp);
-
-                    // Pack into Telemetry
+                    // 5. Populate Telemetry Record
                     rec.status            = 1;
+                    rec.tofRawTicks       = tofRawTicks;
+                    rec.tofCompTicks      = (int64_t)tofCompTicks;
+                    rec.distRawM          = (float)distRaw;
+                    rec.distCfoM          = (float)distCfo;
                     rec.carrierIntegrator = ci;
                     rec.cfoPpm            = (float)cfoPpm;
-                    rec.tofUncompTicks    = tofUncomp;
-                    rec.tofCompTicks      = (int64_t)tofComp;
-                    rec.distUncompM       = (float)distUncomp;
-                    rec.distClockCompM    = (float)distClockComp;
-                    rec.distRssiCompM     = (float)distRssiComp;
-                    rec.distCalibM        = (float)distCalib;
-                    rec.rssi_dbm          = (float)DW1000Ng::getReceivePower();
+                    rec.rssiDbm           = (float)DW1000Ng::getReceivePower();
+                    rec.fpPowerDbm        = (float)DW1000Ng::getFirstPathPower();
+                    rec.rxQuality         = DW1000Ng::getReceiveQuality();
+                    rec.stdNoise          = stdNoise;
+                    rec.fpAmpl1           = fpAmpl1;
+                    rec.fpAmpl2           = fpAmpl2;
+                    rec.fpAmpl3           = fpAmpl3;
+                    rec.cirPwr            = cirPwr;
+                    rec.rxpacc            = rxpacc;
+                    rec.ldeError          = ldeErr;
+                    rec.vbatUwbResp       = respPkt.vbatUwb;
+                    rec.tempUwbResp       = respPkt.tempUwb;
+                    rec.tempEspResp       = respPkt.tempEsp;
                     rec.tTx1              = tTx1;
                     rec.tRx1              = tRx1;
                     rec.tRx2              = tRx2;
                     rec.tTx2              = tTx2;
-                    rec.tempUwbResp       = respPkt.tempUwb;
-                    rec.tempEspResp       = respPkt.tempEsp;
 
                     success = true;
                 }
@@ -339,7 +383,6 @@ void performRangingListenSafe() {
         rxArmedTime = millis();
     }
 
-    // Auto-recovery Watchdog: if receiver is stuck or errored for > 15ms, clear and re-arm
     if (DW1000Ng::isReceiveFailed() || (millis() - rxArmedTime > 15)) {
         DW1000Ng::forceTRxOff();
         DW1000Ng::clearReceiveStatus();
@@ -371,6 +414,7 @@ void performRangingListenSafe() {
                 write40BitTime(respPkt.txTimestamp, tTx2);
                 respPkt.tempUwb     = cachedTempUwb;
                 respPkt.tempEsp     = cachedTempEsp;
+                respPkt.vbatUwb     = cachedVbatUwb;
 
                 DW1000Ng::forceTRxOff();
                 DW1000Ng::clearTransmitStatus();
@@ -394,17 +438,17 @@ void performRangingListenSafe() {
 }
 
 // ==============================================================================
-// 5. PRE-FLIGHT SANITY CHECK (PST) ROUTINE
+// 5. PRE-FLIGHT SANITY CHECK (PST)
 // ==============================================================================
 bool runPreflightSanityCheck() {
-    Serial.println("# [PST] Running 4-Second Pre-Flight Link Sanity Check...");
+    Serial.printf("# [ROBOT %u] Pre-Flight Link Sanity Check...\n", Config::ID);
     uint32_t pstStart = millis();
-    bool peerOk[4] = {false, false, false, false}; // Indices 1..3 for R2, R3, R4
+    bool peerOk[4] = {false, false, false, false};
 
     while (millis() - pstStart < PREFLIGHT_TIMEOUT_MS) {
         if (Config::ID == 1) {
             for (uint8_t target = 2; target <= 4; target++) {
-                FullEdgeTelemetry dummy;
+                RawEdgeTelemetry dummy;
                 if (performRangingPoll(target, dummy)) {
                     peerOk[target - 1] = true;
                 }
@@ -420,13 +464,10 @@ bool runPreflightSanityCheck() {
     if (Config::ID == 1) {
         bool allOk = (peerOk[1] && peerOk[2] && peerOk[3]);
         if (allOk) {
-            Serial.println("# [PST SUCCESS] All 3 peer robots (R2, R3, R4) responded cleanly!");
+            Serial.println("# [PST SUCCESS] Peers (R2, R3, R4) active!");
             return true;
         } else {
-            Serial.printf("# [PST WARNING] Unresponsive peers: %s %s %s\n",
-                          peerOk[1] ? "" : "ROBOT_2_DEAD!",
-                          peerOk[2] ? "" : "ROBOT_3_DEAD!",
-                          peerOk[3] ? "" : "ROBOT_4_DEAD!");
+            Serial.printf("# [PST WARNING] Status: R2:%d R3:%d R4:%d\n", peerOk[1], peerOk[2], peerOk[3]);
             return false;
         }
     }
@@ -440,7 +481,7 @@ void setup() {
     Serial.begin(460800);
     delay(1000);
 
-    // Lock motors in safe electrical brake mode
+    // Active electrical braking for safe static stance
     pinMode(PIN_MOTOR_L_IN1, OUTPUT); pinMode(PIN_MOTOR_L_IN2, OUTPUT);
     pinMode(PIN_MOTOR_R_IN1, OUTPUT); pinMode(PIN_MOTOR_R_IN2, OUTPUT);
     digitalWrite(PIN_MOTOR_L_IN1, HIGH); digitalWrite(PIN_MOTOR_L_IN2, HIGH);
@@ -449,26 +490,22 @@ void setup() {
     setupESPNow();
     setupUWB();
 
-    // Initial temperature capture with validity guard
+    // Initial sensor capture
     float t_raw = DW1000Ng::getTemperature();
     cachedTempEsp = temperatureRead();
-    if (t_raw > -30.0f && t_raw < 90.0f) {
-        cachedTempUwb = t_raw;
-    } else {
-        cachedTempUwb = cachedTempEsp - 1.5f; // Safe empirical fallback for unburned OTP
-    }
+    if (t_raw > -30.0f && t_raw < 90.0f) cachedTempUwb = t_raw;
+    else cachedTempUwb = cachedTempEsp - 1.5f;
+    cachedVbatUwb = DW1000Ng::getBatteryVoltage();
 
     bool pstPassed = runPreflightSanityCheck();
     if (!pstPassed && Config::ID == 1) {
-        rgbLedWrite(PIN_STATUS_RGB, 60, 0, 0); // Blink Red on missing peer
+        rgbLedWrite(PIN_STATUS_RGB, 60, 0, 0); // Red on warning
     } else {
-        rgbLedWrite(PIN_STATUS_RGB, 0, 0, 40); // Solid Blue (Active Measurement)
+        rgbLedWrite(PIN_STATUS_RGB, 0, 0, 40); // Blue (Active)
     }
 
-    // 22-Column Full Metrology Telemetry Header
-    if (Config::ID == 1) {
-        Serial.println("timestamp_ms,frame_id,init_id,resp_id,status,carrier_int,cfo_ppm,tof_uncomp,tof_comp,dist_uncomp_m,dist_clock_m,dist_rssi_m,dist_calib_m,rssi_dbm,tTx1,tRx1,tRx2,tTx2,temp_uwb_init,temp_uwb_resp,temp_esp_init,temp_esp_resp");
-    }
+    // Comprehensive 30-Column CSV Header for Deep Metrology
+    Serial.println("timestamp_ms,frame_id,init_id,resp_id,status,tof_raw,tof_comp,dist_raw_m,dist_cfo_m,carrier_int,cfo_ppm,rssi_dbm,fp_power_dbm,rx_quality,std_noise,fp_ampl1,fp_ampl2,fp_ampl3,cir_pwr,rxpacc,lde_error,vbat_init,vbat_resp,temp_uwb_init,temp_uwb_resp,temp_esp_init,temp_esp_resp,tTx1,tRx1,tRx2,tTx2");
 }
 
 // ==============================================================================
@@ -477,7 +514,7 @@ void setup() {
 void loop() {
     uint32_t nowMs = millis();
 
-    // Master Clock Synchronization (Robot 1)
+    // Robot 1 acts as TDMA Time Beacon Generator
     if (Config::ID == 1) {
         uint64_t curUs = micros();
         if (curUs - frameStartUs >= TDMA_FRAME_US) {
@@ -499,16 +536,17 @@ void loop() {
     uint32_t slotUs = (uint32_t)(micros() - frameStartUs);
 
     // --------------------------------------------------------------------------
-    // SLOT 1 (10 to 30 ms): Link (1 -> 2)
+    // SLOT 1 (15 to 30 ms): Link (1 -> 2)
     // --------------------------------------------------------------------------
     if (slotUs >= 15000 && slotUs < 30000) {
         if (Config::ID == 1) {
             static uint32_t lastPoll1 = 0;
             if (lastPoll1 != globalFrameId) {
                 lastPoll1 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(2, rec);
                 fleetTelemetry[0] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
@@ -522,9 +560,10 @@ void loop() {
             static uint32_t lastPoll2 = 0;
             if (lastPoll2 != globalFrameId) {
                 lastPoll2 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(3, rec);
                 fleetTelemetry[1] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
@@ -538,9 +577,10 @@ void loop() {
             static uint32_t lastPoll3 = 0;
             if (lastPoll3 != globalFrameId) {
                 lastPoll3 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(4, rec);
                 fleetTelemetry[2] = rec;
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
@@ -554,10 +594,10 @@ void loop() {
             static uint32_t lastPoll4 = 0;
             if (lastPoll4 != globalFrameId) {
                 lastPoll4 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(3, rec);
                 fleetTelemetry[3] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
@@ -571,10 +611,10 @@ void loop() {
             static uint32_t lastPoll5 = 0;
             if (lastPoll5 != globalFrameId) {
                 lastPoll5 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(4, rec);
                 fleetTelemetry[4] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
@@ -588,50 +628,63 @@ void loop() {
             static uint32_t lastPoll6 = 0;
             if (lastPoll6 != globalFrameId) {
                 lastPoll6 = globalFrameId;
-                FullEdgeTelemetry rec;
+                RawEdgeTelemetry rec;
                 performRangingPoll(4, rec);
                 fleetTelemetry[5] = rec;
-                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(FullEdgeTelemetry));
+                esp_now_send(BROADCAST_MAC, (uint8_t*)&rec, sizeof(RawEdgeTelemetry));
             }
         } else {
             performRangingListenSafe();
         }
     }
     // --------------------------------------------------------------------------
-    // SLOT 7 (140 to 180 ms): Gateway Streaming (Robot 1)
+    // SLOT 7 (140 to 180 ms): Full-Fleet Universal Serial Streaming (Any Robot)
     // --------------------------------------------------------------------------
     else if (slotUs >= 140000 && slotUs < 180000) {
-        if (Config::ID == 1) {
-            static uint32_t lastPrintedFrame = 0;
-            if (globalFrameId != lastPrintedFrame) {
-                lastPrintedFrame = globalFrameId;
+        static uint32_t lastPrintedFrame = 0;
+        if (globalFrameId != lastPrintedFrame) {
+            lastPrintedFrame = globalFrameId;
 
-                for (uint8_t i = 0; i < 6; i++) {
-                    FullEdgeTelemetry &e = fleetTelemetry[i];
-                    Serial.printf("%lu,%lu,%u,%u,%u,%ld,%.2f,%lld,%lld,%.4f,%.4f,%.4f,%.4f,%.2f,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f\n",
+            for (uint8_t i = 0; i < 6; i++) {
+                RawEdgeTelemetry &e = fleetTelemetry[i];
+                if (e.frameId == globalFrameId) {
+                    Serial.printf("%lu,%lu,%u,%u,%u,%lld,%lld,%.4f,%.4f,%ld,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%u,%u,%u,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%llu,%llu,%llu,%llu\n",
                                   (unsigned long)nowMs, (unsigned long)globalFrameId,
                                   e.initiatorId, e.responderId,
                                   e.status,
+                                  (long long)e.tofRawTicks,
+                                  (long long)e.tofCompTicks,
+                                  e.distRawM,
+                                  e.distCfoM,
                                   (long)e.carrierIntegrator,
                                   e.cfoPpm,
-                                  (long long)e.tofUncompTicks,
-                                  (long long)e.tofCompTicks,
-                                  e.distUncompM,
-                                  e.distClockCompM,
-                                  e.distRssiCompM,
-                                  e.distCalibM,
-                                  e.rssi_dbm,
-                                  (unsigned long long)e.tTx1, (unsigned long long)e.tRx1,
-                                  (unsigned long long)e.tRx2, (unsigned long long)e.tTx2,
-                                  e.tempUwbInit, e.tempUwbResp,
-                                  e.tempEspInit, e.tempEspResp);
+                                  e.rssiDbm,
+                                  e.fpPowerDbm,
+                                  e.rxQuality,
+                                  e.stdNoise,
+                                  e.fpAmpl1,
+                                  e.fpAmpl2,
+                                  e.fpAmpl3,
+                                  e.cirPwr,
+                                  e.rxpacc,
+                                  e.ldeError,
+                                  e.vbatUwbInit,
+                                  e.vbatUwbResp,
+                                  e.tempUwbInit,
+                                  e.tempUwbResp,
+                                  e.tempEspInit,
+                                  e.tempEspResp,
+                                  (unsigned long long)e.tTx1,
+                                  (unsigned long long)e.tRx1,
+                                  (unsigned long long)e.tRx2,
+                                  (unsigned long long)e.tTx2);
                 }
             }
         }
         inRxMode = false;
     }
     // --------------------------------------------------------------------------
-    // SLOT 8 (185 to 195 ms): Periodic Temperature Sampling (Outside RF Windows)
+    // SLOT 8 (185 to 195 ms): Periodic Sensor Sampling (TRx Idle Window)
     // --------------------------------------------------------------------------
     else if (slotUs >= 185000 && slotUs < 195000) {
         static uint32_t lastTempUpdateMs = 0;
@@ -639,15 +692,13 @@ void loop() {
             lastTempUpdateMs = nowMs;
             float t_raw = DW1000Ng::getTemperature();
             cachedTempEsp = temperatureRead();
-            if (t_raw > -30.0f && t_raw < 90.0f) {
-                cachedTempUwb = t_raw;
-            } else {
-                cachedTempUwb = cachedTempEsp - 1.5f;
-            }
+            if (t_raw > -30.0f && t_raw < 90.0f) cachedTempUwb = t_raw;
+            else cachedTempUwb = cachedTempEsp - 1.5f;
+            cachedVbatUwb = DW1000Ng::getBatteryVoltage();
         }
-        if (Config::ID != 1) performRangingListenSafe();
+        performRangingListenSafe();
     } else {
-        if (Config::ID != 1) performRangingListenSafe();
+        performRangingListenSafe();
     }
     yield();
 }

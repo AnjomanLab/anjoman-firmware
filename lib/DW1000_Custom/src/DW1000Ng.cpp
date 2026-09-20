@@ -2185,6 +2185,34 @@ int32_t getCarrierIntegrator() {
         return getClockOffsetRatio() * 1.0e6f;
     }
 
+ChannelDiagnostics getChannelDiagnostics() {
+        ChannelDiagnostics diag = {};
+
+        byte sysStatus[5];
+        _readBytesFromRegister(SYS_STATUS, 0x00, sysStatus, 5);
+        diag.ldeError = (sysStatus[2] & 0x04) ? 1 : 0; // Bit 18 is LDEERR
+
+        byte fqual[8];
+        _readBytesFromRegister(RX_FQUAL, 0x00, fqual, 8);
+        diag.stdNoise = (uint16_t)fqual[0] | ((uint16_t)fqual[1] << 8);
+        diag.fpAmpl2  = (uint16_t)fqual[2] | ((uint16_t)fqual[3] << 8);
+        diag.fpAmpl3  = (uint16_t)fqual[4] | ((uint16_t)fqual[5] << 8);
+        diag.cirPwr   = (uint16_t)fqual[6] | ((uint16_t)fqual[7] << 8);
+
+        byte fpa1[2];
+        _readBytesFromRegister(RX_TIME, 0x07, fpa1, 2);
+        diag.fpAmpl1  = (uint16_t)fpa1[0] | ((uint16_t)fpa1[1] << 8);
+
+        byte finfo[4];
+        _readBytesFromRegister(RX_FINFO, 0x00, finfo, 4);
+        uint32_t rawFinfo = (uint32_t)finfo[0] | ((uint32_t)finfo[1] << 8) | 
+                            ((uint32_t)finfo[2] << 16) | ((uint32_t)finfo[3] << 24);
+        diag.rxpacc   = (uint16_t)((rawFinfo >> 20) & 0x0FFF);
+
+        return diag;
+    }
+
+
 }
 
 

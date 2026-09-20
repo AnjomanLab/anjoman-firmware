@@ -315,6 +315,18 @@ namespace DW1000Ng {
   */
   int32_t getCarrierIntegrator();
 
+	struct ChannelDiagnostics {
+        uint8_t  ldeError;
+        uint16_t stdNoise;
+        uint16_t fpAmpl1;
+        uint16_t fpAmpl2;
+        uint16_t fpAmpl3;
+        uint16_t cirPwr;
+        uint16_t rxpacc;
+    };
+
+    ChannelDiagnostics getChannelDiagnostics();
+
   /**
   Calculates clock frequency offset ratio relative to remote transmitter
   For Channel 5 (6489.6 MHz) and 850 kbps / 6.8 Mbps:
