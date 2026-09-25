@@ -3,7 +3,6 @@ ekf_anjoman.md
 .pio/
 vis/
 logs/
-*.py
 *.txt
 *.ipynb
 plots/
