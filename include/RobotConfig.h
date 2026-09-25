@@ -196,12 +196,12 @@ namespace Config {
     // ==============================================================================
     // 4. BASE NETWORK TELEMETRY PARAMETERS
     // ==============================================================================
-    constexpr const char* WIFI_SSID          = "Oochoo";
-    constexpr const char* WIFI_PASSWORD      = "ax200ax200";
+    constexpr const char* WIFI_SSID          = "H11T";
+    constexpr const char* WIFI_PASSWORD      = "123456788";
     constexpr uint16_t    NETCAT_PORT        = 9000;
 
-    const IPAddress STATIC_IP(192, 168, 1, 150 + (ID - 1));
-    const IPAddress GATEWAY(192, 168, 1, 1);
+    const IPAddress STATIC_IP(192, 168, 242, 150 + (ID - 1));
+    const IPAddress GATEWAY(192, 168, 242, 164);
     const IPAddress SUBNET(255, 255, 255, 0);
 
 } // namespace Config
