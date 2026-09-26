@@ -1,18 +1,11 @@
 {
   "name": "BMI160_Custom",
-  "version": "2.0.0",
-  "description": "Custom thread-safe Bosch BMI160 IMU library using RAII Mutex lock for ESP32-S3. Strip rp2040 mutex headers and standardize on std::mutex.",
+  "version": "2.1.0",
+  "description": "Thread-safe Bosch BMI160 IMU driver using AnjomanI2C mutex guard",
   "keywords": "imu, bmi160, bosch, robotics, thread-safe",
-  "repository": {
-    "type": "git",
-    "url": "local"
-  },
-  "authors": [
-    {
-      "name": "Anjoman Swarm Team"
-    }
-  ],
   "frameworks": "arduino",
   "platforms": "espressif32",
-  "dependencies": {}
+  "dependencies": {
+    "AnjomanI2C": "*"
+  }
 }

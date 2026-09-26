@@ -1,0 +1,10 @@
+{
+  "name": "AnjomanLogging",
+  "version": "1.0.0",
+  "description": "RAM-buffered maneuver logger with CRC32 integrity check and HTTP download server",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AnjomanConfig": "*"
+  }
+}

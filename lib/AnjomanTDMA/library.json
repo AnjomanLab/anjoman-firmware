@@ -1,0 +1,10 @@
+{
+  "name": "AnjomanTDMA",
+  "version": "1.0.0",
+  "description": "Deterministic TDMA scheduler with master-driven sync beacons and per-slave local fallback when sync is lost",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AnjomanConfig": "*"
+  }
+}

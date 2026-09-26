@@ -1,7 +1,17 @@
 {
   "name": "MotorController",
-  "version": "2.0.0",
-  "description": "ESP32-S3 LEDC-based motor driver wrapper for DRV8833. migrate to modern ledcAttach API for ESP32 Core 3.x. Also add physical feedforward with dynamic INA226 voltage scaling and add PI feedback with anti-windup clamping and tick sync injection",
+  "version": "2.1.0",
+  "description": "ESP32-S3 LEDC-based motor driver for DRV8833 with feedforward+PI velocity control. Compatible with Arduino Core 2.x (ledcSetup + ledcAttachPin).",
+  "keywords": "motor, drv8833, ledc, pwm, pid, esp32",
+  "repository": {
+    "type": "git",
+    "url": "local"
+  },
+  "authors": [
+    {
+      "name": "Anjoman Swarm Team"
+    }
+  ],
   "frameworks": "arduino",
   "platforms": "espressif32",
   "dependencies": {}

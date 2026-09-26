@@ -2,10 +2,12 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include "AnjomanI2C.h"
 
 class MagneticEncoder {
 public:
-    MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress, uint8_t muxChannel, bool invert = false);
+    MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress,
+                    uint8_t muxChannel, bool invert = false);
 
     bool begin();
     bool update(float dt);
@@ -40,4 +42,4 @@ private:
     float    _currentRadPerSec;
 
     bool selectMuxChannel();
-};
+};;

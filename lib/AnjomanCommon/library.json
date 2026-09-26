@@ -1,0 +1,7 @@
+{
+  "name": "AnjomanCommon",
+  "version": "1.0.0",
+  "description": "Shared packet and record types across Anjoman modules",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

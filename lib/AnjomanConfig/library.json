@@ -1,0 +1,7 @@
+{
+  "name": "AnjomanConfig",
+  "version": "1.0.0",
+  "description": "Project-wide configuration: pinout, per-robot kinematics, drivetrain parameters, IMU biases",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

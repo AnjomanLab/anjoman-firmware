@@ -1,6 +1,7 @@
 #include "MagneticEncoder.h"
 
-MagneticEncoder::MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress, uint8_t muxChannel, bool invert)
+MagneticEncoder::MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress,
+                                 uint8_t muxChannel, bool invert)
     : _wire(wireInstance),
       _muxAddress(muxAddress),
       _muxChannel(muxChannel),
@@ -14,9 +15,12 @@ MagneticEncoder::MagneticEncoder(TwoWire &wireInstance, uint8_t muxAddress, uint
       _currentRadPerSec(0.0f) {}
 
 bool MagneticEncoder::begin() {
+    AnjomanI2C::Guard g;
+    if (!g.isValid()) return false;
     return selectMuxChannel();
 }
 
+// NOTE: caller must hold the I2C guard.
 bool MagneticEncoder::selectMuxChannel() {
     if (_muxChannel > 7) return false;
     _wire.beginTransmission(_muxAddress);
@@ -25,6 +29,12 @@ bool MagneticEncoder::selectMuxChannel() {
 }
 
 bool MagneticEncoder::update(float dt) {
+    // ---- Take I2C mutex for the full transaction sequence ----
+    AnjomanI2C::Guard g;
+    if (!g.isValid()) {
+        return false;
+    }
+
     if (!selectMuxChannel()) {
         return false;
     }
@@ -47,6 +57,7 @@ bool MagneticEncoder::update(float dt) {
 
     int16_t currentRaw = (int16_t)raw;
 
+    // ---- Angle unwrapping (no I2C) ----
     if (_isFirstRead) {
         _lastRawAngle = currentRaw;
         _isFirstRead = false;
@@ -69,11 +80,9 @@ bool MagneticEncoder::update(float dt) {
     _cumulativeSteps += delta;
     _lastRawAngle = currentRaw;
 
+    // ---- Velocity computation (no I2C) ----
     if (dt > 0.0001f) {
-        // Raw RPM calculation: (delta / 4096) * (60 / dt)
         float instantRPM = ((float)delta / ENCODER_CPR) * (60.0f / dt);
-        
-        // Correct 1st-order LPF: alpha = 0.30, (1 - alpha) = 0.70
         _currentRPM = 0.30f * instantRPM + 0.70f * _currentRPM;
         _currentRadPerSec = _currentRPM * (TWO_PI_F / 60.0f);
     }

@@ -1,0 +1,10 @@
+{
+  "name": "INA226_Custom",
+  "version": "1.0.0",
+  "description": "Thread-safe INA226 power monitor driver using AnjomanI2C mutex guard",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AnjomanI2C": "*"
+  }
+}

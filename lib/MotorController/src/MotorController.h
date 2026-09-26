@@ -26,7 +26,9 @@ public:
     void setPIDGains(const PIDGains &gains);
 
     // Closed-loop velocity control (returns computed PWM command in [-1.0, 1.0])
-    float computeVelocityControl(float targetRPM, float measuredRPM, float vBatt, float dt, float crossCoupledTerm = 0.0f);
+    float computeVelocityControl(float targetRPM, float measuredRPM,
+                                 float vBatt, float dt,
+                                 float crossCoupledTerm = 0.0f);
 
     // Direct open-loop duty control [-1.0, 1.0]
     void setOpenLoopDuty(float duty);
@@ -38,6 +40,8 @@ public:
 private:
     uint8_t _pinIn1;
     uint8_t _pinIn2;
+    uint8_t _ch1;    // LEDC channel for pinIn1
+    uint8_t _ch2;    // LEDC channel for pinIn2
     bool    _invert;
 
     uint32_t _pwmFreqHz;

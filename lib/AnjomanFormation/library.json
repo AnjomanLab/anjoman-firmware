@@ -1,0 +1,10 @@
+{
+  "name": "AnjomanFormation",
+  "version": "1.0.0",
+  "description": "Formation reference trajectory (quintic) and virtual look-ahead feedback linearization controller",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AnjomanConfig": "*"
+  }
+}

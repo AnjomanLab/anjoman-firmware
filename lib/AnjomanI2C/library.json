@@ -1,0 +1,7 @@
+{
+  "name": "AnjomanI2C",
+  "version": "1.0.0",
+  "description": "Thread-safe I2C bus wrapper for ESP32 dual-core access. Provides a FreeRTOS mutex and RAII guard for atomic Wire transactions.",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "AnjomanStateEstimation",
+  "version": "1.0.0",
+  "description": "UWB preprocessing, heading estimation, and (future) cooperative EKF",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AnjomanConfig": "*"
+  }
+}
