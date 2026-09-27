@@ -24,7 +24,7 @@
 #include "TDMAEngine.h"
 
 // ==============================================================================
-// 1. TIME / PHYSICS CONSTANTS
+// 1. CONSTANTS
 // ==============================================================================
 constexpr double SPEED_OF_LIGHT = 299792458.0;
 constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103;
@@ -59,41 +59,47 @@ ManeuverLogger  logger;
 TDMAEngine      tdma;
 
 // ==============================================================================
-// 3. SHARED STATE (expanded for v2 logging)
+// 3. DECENTRALIZED TDMA SLOT TABLE
+// ==============================================================================
+struct SlotAction {
+    uint8_t actor;      // 1..4 (transmitting robot), 0 = idle
+    uint8_t target;     // 0 for beacon, else responder ID
+    bool    isBeacon;
+};
+
+static const SlotAction SLOT_TABLE[16] = {
+    {1, 0, true},  {1, 2, false}, {1, 3, false}, {1, 4, false},
+    {2, 0, true},  {2, 1, false}, {2, 3, false}, {2, 4, false},
+    {3, 0, true},  {3, 1, false}, {3, 2, false}, {3, 4, false},
+    {4, 0, true},  {4, 1, false}, {4, 2, false}, {4, 3, false},
+};
+
+// ==============================================================================
+// 4. SHARED STATE
 // ==============================================================================
 struct SharedState {
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-    // Pose (from ESKF)
     float posX, posY, headingRad;
-
-    // Chassis commands (from formation controller)
     float vCommand, omegaCommand;
-
-    // Wheel speeds
     float rpmL, rpmR;
-
-    // IMU
     float gyroZ;
     float imuTempC;
     float accelX;
 
-    // ESKF covariance diagonal
     float eskfVarX, eskfVarY, eskfVarTheta, eskfVarBias;
 
-    // Motor detail
     float dutyL, dutyR;
     float targetRpmL, targetRpmR;
 
-    // Maneuver state
     bool     maneuverRunning;
     bool     maneuverFinished;
     uint32_t maneuverStartMs;
-    uint8_t  robotState;   // 0=idle, 1=running, 2=finished
+    uint8_t  robotState;
 } g_shared;
 
 // ==============================================================================
-// 4. UWB METRICS — one per peer (index 1..4)
+// 5. UWB METRICS PER PEER
 // ==============================================================================
 struct UWBMetrics {
     bool     valid;
@@ -110,16 +116,20 @@ struct UWBMetrics {
     float    fpPower;
     float    respTemp;
 };
-UWBMetrics g_uwbMetrics[5];   // index 1..4 used
+UWBMetrics g_uwbMetrics[5];
 
-// Shared across all peers (last seen)
 uint16_t g_lastRxpacc = 0;
-
-// UWB chip temperature cache
-float g_cachedTempUwb = 25.0f;
+float    g_cachedTempUwb = 25.0f;
 
 // ==============================================================================
-// 5. UTILITIES
+// 6. CONSENSUS STATE
+// ==============================================================================
+static uint8_t  g_peersSeenMask       = 0;
+static uint32_t g_candidateStartFrame = 0;
+static bool     g_maneuverTriggered   = false;
+
+// ==============================================================================
+// 7. UTILITIES
 // ==============================================================================
 inline void write40BitTime(uint8_t *dest, uint64_t val) {
     dest[0] = (uint8_t)(val & 0xFF);
@@ -137,17 +147,8 @@ inline uint64_t read40BitTime(const uint8_t *src) {
            (((uint64_t)src[4]) << 32);
 }
 
-// Fill the three peer IDs for a given robot (excluding self).
-void getPeerList(uint8_t selfId, uint8_t peers[3]) {
-    uint8_t idx = 0;
-    for (uint8_t p = 1; p <= 4; p++) {
-        if (p == selfId) continue;
-        peers[idx++] = p;
-    }
-}
-
 // ==============================================================================
-// 6. CORE 1 — 100 Hz real-time loop (motor + ESKF + sensor acquisition)
+// 8. CORE 1 — 100 Hz real-time loop
 // ==============================================================================
 void Core1_ControlTask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -191,7 +192,6 @@ void Core1_ControlTask(void *pvParameters) {
         odomY = g_eskf.getY();
         const float odomTheta = g_eskf.getTheta();
 
-        // ---- Snapshot commands and flags ----
         portENTER_CRITICAL(&g_shared.mux);
         const float targetV     = g_shared.vCommand;
         const float targetOmega = g_shared.omegaCommand;
@@ -199,7 +199,6 @@ void Core1_ControlTask(void *pvParameters) {
         const bool  isFinished  = g_shared.maneuverFinished;
         portEXIT_CRITICAL(&g_shared.mux);
 
-        // ---- Compute motor commands ----
         float dutyL = 0.0f, dutyR = 0.0f;
         float targetRpmL = 0.0f, targetRpmR = 0.0f;
 
@@ -217,7 +216,6 @@ void Core1_ControlTask(void *pvParameters) {
             dutyR = motorR.computeVelocityControl(targetRpmR, measRpmR, 7.4f, dt);
         }
 
-        // ---- Publish to shared memory ----
         portENTER_CRITICAL(&g_shared.mux);
         g_shared.posX          = odomX;
         g_shared.posY          = odomY;
@@ -242,7 +240,7 @@ void Core1_ControlTask(void *pvParameters) {
 }
 
 // ==============================================================================
-// 7. ESP-NOW
+// 9. ESP-NOW
 // ==============================================================================
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
     if (data_len != sizeof(SyncBeaconPacket)) return;
@@ -250,15 +248,19 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
     SyncBeaconPacket pkt;
     memcpy(&pkt, data, sizeof(pkt));
 
-    if (tdma.isMaster()) return;
+    if (pkt.senderId == Config::ID) return;
 
-    tdma.onSyncReceived(pkt.frameId, pkt.timestampMs, micros());
+    tdma.onSyncReceived(pkt.senderId,
+                        pkt.frameId,
+                        pkt.senderUptimeMs,
+                        pkt.senderSlot,
+                        millis(),
+                        micros());
 
-    if (pkt.maneuverActive && !g_shared.maneuverRunning) {
-        portENTER_CRITICAL(&g_shared.mux);
-        g_shared.maneuverRunning = true;
-        g_shared.maneuverStartMs = pkt.maneuverStartMs;
-        portEXIT_CRITICAL(&g_shared.mux);
+    // Track peers and converge on maneuver start frame
+    g_peersSeenMask |= (1u << pkt.senderId);
+    if (pkt.maneuverStartFrame > g_candidateStartFrame) {
+        g_candidateStartFrame = pkt.maneuverStartFrame;
     }
 }
 
@@ -282,7 +284,7 @@ void setupESPNow() {
 }
 
 // ==============================================================================
-// 8. UWB RANGING
+// 10. UWB
 // ==============================================================================
 void setupUWB() {
     pinMode(PIN_UWB_RST, OUTPUT);
@@ -319,7 +321,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
     DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
     DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
 
-    uint32_t txStart = millis();
+    const uint32_t txStart = millis();
     while (!DW1000Ng::isTransmitDone()) {
         if (millis() - txStart > 4) return false;
         yield();
@@ -328,10 +330,10 @@ bool performRangingPoll(uint8_t targetPeerId) {
     const uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
 
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
-    uint32_t waitRx = millis();
+    const uint32_t waitRx = millis();
     bool success = false;
 
-    while (millis() - waitRx < 5) {
+    while (millis() - waitRx < 8) {
         if (DW1000Ng::isReceiveDone()) {
             DW1000Ng::clearReceiveStatus();
             const size_t len = DW1000Ng::getReceivedDataLength();
@@ -388,86 +390,109 @@ bool performRangingPoll(uint8_t targetPeerId) {
     return success;
 }
 
-void performRangingListenSafe() {
-    static uint32_t rxArmedTime = 0;
-
+// Blocking responder: listen for the entire slot window (up to 13 ms),
+// so we are still receiving when the initiator's poll arrives mid-slot.
+bool performRangingListenBlocking(uint32_t timeoutMs) {
+    DW1000Ng::forceTRxOff();
+    DW1000Ng::clearReceiveStatus();
+    DW1000Ng::clearTransmitStatus();
     DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
 
-    if (DW1000Ng::isReceiveFailed() || (millis() - rxArmedTime > 12)) {
-        DW1000Ng::forceTRxOff();
-        DW1000Ng::clearReceiveStatus();
-        DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
-        rxArmedTime = millis();
-        return;
-    }
+    const uint32_t t_start = millis();
+    bool success = false;
 
-    if (DW1000Ng::isReceiveDone()) {
-        DW1000Ng::clearReceiveStatus();
-        const size_t len = DW1000Ng::getReceivedDataLength();
+    while (millis() - t_start < timeoutMs) {
+        if (DW1000Ng::isReceiveDone()) {
+            DW1000Ng::clearReceiveStatus();
+            const size_t len = DW1000Ng::getReceivedDataLength();
 
-        if (len >= sizeof(UWBPollPacket)) {
-            UWBPollPacket pollPkt;
-            DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pollPkt),
-                                      sizeof(pollPkt));
+            if (len >= sizeof(UWBPollPacket)) {
+                UWBPollPacket pollPkt;
+                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pollPkt),
+                                          sizeof(pollPkt));
 
-            if (memcmp(pollPkt.header, "POLL", 4) == 0 &&
-                pollPkt.targetId == Config::ID) {
+                if (memcmp(pollPkt.header, "POLL", 4) == 0 &&
+                    pollPkt.targetId == Config::ID) {
 
-                const uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
-                const uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) &
-                                      0xFFFFFFFE00ULL;
+                    const uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
+                    const uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) &
+                                          0xFFFFFFFE00ULL;
 
-                UWBResponsePacket respPkt = {};
-                memcpy(respPkt.header, "RESP", 4);
-                respPkt.responderId = Config::ID;
-                respPkt.targetId    = pollPkt.initiatorId;
-                respPkt.sequence    = pollPkt.sequence;
-                write40BitTime(respPkt.rxTimestamp, tRx2);
-                write40BitTime(respPkt.txTimestamp, tTx2);
-                respPkt.tempUwb     = g_cachedTempUwb;
-                respPkt.tempEsp     = 25.0f;
+                    UWBResponsePacket respPkt = {};
+                    memcpy(respPkt.header, "RESP", 4);
+                    respPkt.responderId = Config::ID;
+                    respPkt.targetId    = pollPkt.initiatorId;
+                    respPkt.sequence    = pollPkt.sequence;
+                    write40BitTime(respPkt.rxTimestamp, tRx2);
+                    write40BitTime(respPkt.txTimestamp, tTx2);
+                    respPkt.tempUwb     = g_cachedTempUwb;
+                    respPkt.tempEsp     = 25.0f;
 
-                DW1000Ng::forceTRxOff();
-                DW1000Ng::clearTransmitStatus();
-                DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&respPkt),
-                                          sizeof(respPkt));
-                DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
-                DW1000Ng::startTransmit(TransmitMode::DELAYED);
+                    DW1000Ng::forceTRxOff();
+                    DW1000Ng::clearTransmitStatus();
+                    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&respPkt),
+                                              sizeof(respPkt));
+                    DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
+                    DW1000Ng::startTransmit(TransmitMode::DELAYED);
 
-                const uint32_t txWait = millis();
-                while (!DW1000Ng::isTransmitDone()) {
-                    if (millis() - txWait > 6) break;
-                    yield();
+                    const uint32_t txWait = millis();
+                    while (!DW1000Ng::isTransmitDone()) {
+                        if (millis() - txWait > 6) break;
+                        yield();
+                    }
+                    DW1000Ng::clearTransmitStatus();
+                    success = true;
+                    break;
                 }
-                DW1000Ng::clearTransmitStatus();
             }
+            // Not our poll; keep listening
         }
-        DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
-        rxArmedTime = millis();
+
+        if (DW1000Ng::isReceiveFailed() || DW1000Ng::isReceiveTimeout()) {
+            DW1000Ng::clearReceiveStatus();
+        }
+
+        yield();
     }
+
+    DW1000Ng::forceTRxOff();
+    return success;
 }
 
 // ==============================================================================
-// 9. TDMA MESH SLOT TABLE
+// 11. SLOT HANDLER AND BEACON
 // ==============================================================================
-// Slot 0 is reserved for the sync beacon margin.
-// Slots 1..12 cover the full 4-robot directed mesh.
-// ==============================================================================
-struct SlotPair {
-    uint8_t initiator;
-    uint8_t target;
-};
+static void sendBeacon(uint8_t slot) {
+    SyncBeaconPacket pkt = {};
+    pkt.senderId           = Config::ID;
+    pkt.senderSlot         = slot;
+    pkt.frameId            = tdma.getFrameId();
+    pkt.senderUptimeMs     = millis();
+    pkt.maneuverStartFrame = g_candidateStartFrame;
+    esp_now_send(BROADCAST_MAC, (uint8_t*)&pkt, sizeof(pkt));
+}
 
-const SlotPair SLOT_PAIRS[13] = {
-    { 0, 0 },  // slot 0 — unused
-    { 1, 2 }, { 1, 3 }, { 1, 4 },   // R1 outgoing
-    { 2, 1 }, { 2, 3 }, { 2, 4 },   // R2 outgoing
-    { 3, 1 }, { 3, 2 }, { 3, 4 },   // R3 outgoing
-    { 4, 1 }, { 4, 2 }, { 4, 3 }    // R4 outgoing
-};
+static void handleSlot(uint32_t slot) {
+    if (slot >= 16) return;
+    const SlotAction &a = SLOT_TABLE[slot];
+
+    if (a.isBeacon) {
+        if (a.actor == Config::ID) {
+            sendBeacon((uint8_t)slot);
+        }
+        return;
+    }
+
+    if (a.actor == Config::ID) {
+        performRangingPoll(a.target);
+    } else if (a.target == Config::ID) {
+        performRangingListenBlocking(13);
+    }
+    // else: idle for this slot
+}
 
 // ==============================================================================
-// 10. SETUP
+// 12. SETUP
 // ==============================================================================
 void setup() {
     Serial.begin(460800);
@@ -504,8 +529,7 @@ void setup() {
     setupUWB();
 
     logger.init();
-
-    tdma.init(Config::ID, /*isMaster=*/ (Config::ID == 1));
+    tdma.init(Config::ID);
 
     for (int i = 0; i < 5; i++) g_uwbMetrics[i] = UWBMetrics{};
 
@@ -523,15 +547,13 @@ void setup() {
 }
 
 // ==============================================================================
-// 11. CORE 0 LOOP
+// 13. CORE 0 LOOP
 // ==============================================================================
 void loop() {
     const uint32_t nowMs = millis();
     tdma.tick(nowMs, micros());
 
-    // --------------------------------------------------------------------------
-    // UWB temperature refresh (every 500 ms)
-    // --------------------------------------------------------------------------
+    // ---- UWB temperature refresh ----
     static uint32_t lastTempMs = 0;
     if (nowMs - lastTempMs >= 500) {
         lastTempMs = nowMs;
@@ -541,35 +563,30 @@ void loop() {
         }
     }
 
-    // --------------------------------------------------------------------------
-    // Master: broadcast sync beacon each frame
-    // --------------------------------------------------------------------------
-    if (tdma.shouldBroadcastSync()) {
-        static bool autoTriggerArmed = false;
-        static uint32_t mStartMs = 0;
-
-        if (!autoTriggerArmed && nowMs >= TDMAConfig::AUTO_START_DELAY_MS) {
-            autoTriggerArmed = true;
-            mStartMs = nowMs + 1000;
-
-            portENTER_CRITICAL(&g_shared.mux);
-            g_shared.maneuverRunning = true;
-            g_shared.maneuverStartMs = mStartMs;
-            g_shared.robotState      = 1;
-            portEXIT_CRITICAL(&g_shared.mux);
+    // ---- Consensus: propose a start frame once all peers have been seen ----
+    if (g_candidateStartFrame == 0) {
+        const uint8_t selfBit    = (1u << Config::ID);
+        const uint8_t allPeers   = 0b11110u & ~selfBit;   // bits for 3 peers
+        if ((g_peersSeenMask & allPeers) == allPeers) {
+            g_candidateStartFrame = tdma.getFrameId() + 100;
         }
-
-        SyncBeaconPacket sync = {};
-        sync.frameId          = tdma.getFrameId();
-        sync.timestampMs      = nowMs;
-        sync.maneuverActive   = (uint8_t)(autoTriggerArmed ? 1 : 0);
-        sync.maneuverStartMs  = mStartMs;
-        esp_now_send(BROADCAST_MAC, (uint8_t*)&sync, sizeof(sync));
     }
 
-    // --------------------------------------------------------------------------
-    // 10 Hz formation controller
-    // --------------------------------------------------------------------------
+    // ---- Maneuver trigger ----
+    if (!g_maneuverTriggered &&
+        g_candidateStartFrame > 0 &&
+        tdma.getFrameId() >= g_candidateStartFrame) {
+
+        g_maneuverTriggered = true;
+
+        portENTER_CRITICAL(&g_shared.mux);
+        g_shared.maneuverRunning = true;
+        g_shared.maneuverStartMs = nowMs;
+        g_shared.robotState      = 1;
+        portEXIT_CRITICAL(&g_shared.mux);
+    }
+
+    // ---- Formation controller (10 Hz sub-rate) ----
     static uint32_t lastCtrlMs = 0;
     if (nowMs - lastCtrlMs >= 100) {
         lastCtrlMs = nowMs;
@@ -619,100 +636,89 @@ void loop() {
         logger.handleClient();
     }
 
-    // --------------------------------------------------------------------------
-    // 5 Hz RAM logging (schema v2)
-    // --------------------------------------------------------------------------
-    static uint32_t lastLogMs = 0;
-    if (nowMs - lastLogMs >= Config::TELEMETRY_PERIOD_MS) {
-        lastLogMs = nowMs;
-
-        if (g_shared.maneuverRunning && !g_shared.maneuverFinished) {
-            LogRecord rec = {};
-
-            // ---- Snapshot shared state ----
-            portENTER_CRITICAL(&g_shared.mux);
-            rec.t_ms            = nowMs;
-            rec.x               = g_shared.posX;
-            rec.y               = g_shared.posY;
-            rec.heading         = g_shared.headingRad;
-            rec.v_cmd           = g_shared.vCommand;
-            rec.omega_cmd       = g_shared.omegaCommand;
-            rec.rpm_l           = g_shared.rpmL;
-            rec.rpm_r           = g_shared.rpmR;
-            rec.gyro_z          = g_shared.gyroZ;
-            rec.imu_temp_c      = g_shared.imuTempC;
-            rec.imu_accel_x     = g_shared.accelX;
-            rec.eskf_var_x      = g_shared.eskfVarX;
-            rec.eskf_var_y      = g_shared.eskfVarY;
-            rec.eskf_var_theta  = g_shared.eskfVarTheta;
-            rec.eskf_var_bias   = g_shared.eskfVarBias;
-            rec.duty_l          = g_shared.dutyL;
-            rec.duty_r          = g_shared.dutyR;
-            rec.target_rpm_l    = g_shared.targetRpmL;
-            rec.target_rpm_r    = g_shared.targetRpmR;
-            rec.robot_state     = g_shared.robotState;
-            portEXIT_CRITICAL(&g_shared.mux);
-
-            // ---- Power monitor ----
-            float vBat = 7.4f, iBat = 0.0f, pBat = 0.0f;
-            power_monitor.read(vBat, iBat, pBat);
-            rec.vbat      = vBat;
-            rec.current_a = iBat;
-
-            // ---- UWB peer blocks ----
-            uint8_t peers[3];
-            getPeerList(Config::ID, peers);
-
-            for (int i = 0; i < 3; i++) {
-                const UWBMetrics &m = g_uwbMetrics[peers[i]];
-                UWBPeerBlock &blk = rec.uwb[i];
-                blk.peerId    = peers[i];
-                blk.ldeErr    = m.valid ? m.ldeErr    : 0;
-                blk.stdNoise  = m.valid ? m.stdNoise  : 0;
-                blk.fpAmpl1   = m.valid ? m.fpAmpl1   : 0;
-                blk.fpAmpl2   = m.valid ? m.fpAmpl2   : 0;
-                blk.cirPwr    = m.valid ? m.cirPwr    : 0;
-                blk.rawDist   = m.valid ? m.rawDist   : 0.0f;
-                blk.cleanDist = m.valid ? m.cleanDist : 0.0f;
-                blk.rssi      = m.valid ? m.rssi      : 0.0f;
-                blk.fpPower   = m.valid ? m.fpPower   : 0.0f;
-                blk.respTemp  = m.valid ? m.respTemp  : 0.0f;
-            }
-            rec.rxpacc = g_lastRxpacc;
-
-            // ---- TDMA state ----
-            rec.tdma_frame_id   = tdma.getFrameId();
-            rec.tdma_slot_index = (uint8_t)tdma.getCurrentSlotIndex();
-            rec.tdma_sync_lost  = tdma.isSyncLost() ? 1 : 0;
-            rec.maneuver_id     = 1;
-
-            logger.record(rec);
-        }
-    }
-
-    // --------------------------------------------------------------------------
-    // TDMA mesh slot execution (one action per slot change)
-    // --------------------------------------------------------------------------
-    static uint32_t lastActedFrame = UINT32_MAX;
-    static uint32_t lastActedSlot  = UINT32_MAX;
-
+    // ---- Slot execution ----
     const uint32_t frame = tdma.getFrameId();
     const uint32_t slot  = tdma.getCurrentSlotIndex();
 
+    static uint32_t lastActedFrame = UINT32_MAX;
+    static uint32_t lastActedSlot  = UINT32_MAX;
+
+    // ---- Log check (before the slot's blocking operations) ----
+    static uint32_t lastLoggedFrame = UINT32_MAX;
+    const bool logArmed = g_shared.maneuverRunning && !g_shared.maneuverFinished;
+    const uint32_t logTargetSlot = frame % 16;
+
+    if (logArmed && frame != lastLoggedFrame && slot == logTargetSlot) {
+        lastLoggedFrame = frame;
+
+        LogRecord rec = {};
+
+        portENTER_CRITICAL(&g_shared.mux);
+        rec.t_ms            = nowMs;
+        rec.x               = g_shared.posX;
+        rec.y               = g_shared.posY;
+        rec.heading         = g_shared.headingRad;
+        rec.v_cmd           = g_shared.vCommand;
+        rec.omega_cmd       = g_shared.omegaCommand;
+        rec.rpm_l           = g_shared.rpmL;
+        rec.rpm_r           = g_shared.rpmR;
+        rec.gyro_z          = g_shared.gyroZ;
+        rec.imu_temp_c      = g_shared.imuTempC;
+        rec.imu_accel_x     = g_shared.accelX;
+        rec.eskf_var_x      = g_shared.eskfVarX;
+        rec.eskf_var_y      = g_shared.eskfVarY;
+        rec.eskf_var_theta  = g_shared.eskfVarTheta;
+        rec.eskf_var_bias   = g_shared.eskfVarBias;
+        rec.duty_l          = g_shared.dutyL;
+        rec.duty_r          = g_shared.dutyR;
+        rec.target_rpm_l    = g_shared.targetRpmL;
+        rec.target_rpm_r    = g_shared.targetRpmR;
+        rec.robot_state     = g_shared.robotState;
+        portEXIT_CRITICAL(&g_shared.mux);
+
+        float vBat = 7.4f, iBat = 0.0f, pBat = 0.0f;
+        power_monitor.read(vBat, iBat, pBat);
+        rec.vbat      = vBat;
+        rec.current_a = iBat;
+
+        // UWB peer blocks
+        uint8_t peers[3];
+        uint8_t pidx = 0;
+        for (uint8_t p = 1; p <= 4; p++) {
+            if (p == Config::ID) continue;
+            peers[pidx++] = p;
+        }
+
+        for (int i = 0; i < 3; i++) {
+            const UWBMetrics &m = g_uwbMetrics[peers[i]];
+            UWBPeerBlock &blk = rec.uwb[i];
+            blk.peerId    = peers[i];
+            blk.ldeErr    = m.valid ? m.ldeErr    : 0;
+            blk.stdNoise  = m.valid ? m.stdNoise  : 0;
+            blk.fpAmpl1   = m.valid ? m.fpAmpl1   : 0;
+            blk.fpAmpl2   = m.valid ? m.fpAmpl2   : 0;
+            blk.cirPwr    = m.valid ? m.cirPwr    : 0;
+            blk.rawDist   = m.valid ? m.rawDist   : 0.0f;
+            blk.cleanDist = m.valid ? m.cleanDist : 0.0f;
+            blk.rssi      = m.valid ? m.rssi      : 0.0f;
+            blk.fpPower   = m.valid ? m.fpPower   : 0.0f;
+            blk.respTemp  = m.valid ? m.respTemp  : 0.0f;
+        }
+        rec.rxpacc = g_lastRxpacc;
+
+        rec.tdma_frame_id   = frame;
+        rec.tdma_slot_index = (uint8_t)slot;
+        rec.tdma_sync_lost  = tdma.isSyncLost() ? 1 : 0;
+        rec.maneuver_id     = 1;
+
+        logger.record(rec);
+    }
+
+    // ---- Slot execution (once per slot change) ----
     if (frame != lastActedFrame || slot != lastActedSlot) {
         lastActedFrame = frame;
         lastActedSlot  = slot;
-
-        if (slot >= 1 && slot <= 12) {
-            const SlotPair &sp = SLOT_PAIRS[slot];
-
-            if (sp.initiator == Config::ID) {
-                performRangingPoll(sp.target);
-            } else if (sp.target == Config::ID) {
-                performRangingListenSafe();
-            }
-            // else: idle
-        }
+        handleSlot(slot);
     }
 
     yield();
