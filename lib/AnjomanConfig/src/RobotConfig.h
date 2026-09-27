@@ -72,6 +72,23 @@ namespace Config {
     constexpr float   Q_YAW_DISCRETE         = 6.30e-9f;
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.45e-6f;
+        
+    // ------------------------------------------------------------------
+    // ESKF (local error-state Kalman filter, 4-state)
+    // ------------------------------------------------------------------
+    // q values are CONTINUOUS-TIME densities (per second), not per-step
+    // variances. They are derived from the discrete HKF values:
+    //     Q_THETA_ESKF = Q_YAW_DISCRETE   / CONTROL_PERIOD_S
+    //     Q_BIAS_ESKF  = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S
+    //     R_THETA_ESKF = R_YAW_ENCODER    (measurement noise, unchanged)
+    // Q_POS_ESKF is new — set from observed odometry drift:
+    //     drift rate ~1 cm/m at 15 cm/s  →  var rate ~2.25e-6 m²/s
+    //     we choose a slightly conservative 1e-6 m²/s for smoothness.
+    // ------------------------------------------------------------------
+    constexpr float Q_POS_ESKF             = 1.00e-6f;                        // [m²/s]
+    constexpr float Q_THETA_ESKF           = Q_YAW_DISCRETE   / CONTROL_PERIOD_S;   // [rad²/s]
+    constexpr float Q_BIAS_ESKF            = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S;   // [(rad/s)²/s]
+    constexpr float R_THETA_ESKF           = R_YAW_ENCODER;                   // [rad²]
 
     constexpr float   IMU_OFFSET_LON_M       = 0.0358f;
     constexpr float   IMU_OFFSET_LAT_M       = -0.0284f;
@@ -107,6 +124,23 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
+    // ------------------------------------------------------------------
+    // ESKF (local error-state Kalman filter, 4-state)
+    // ------------------------------------------------------------------
+    // q values are CONTINUOUS-TIME densities (per second), not per-step
+    // variances. They are derived from the discrete HKF values:
+    //     Q_THETA_ESKF = Q_YAW_DISCRETE   / CONTROL_PERIOD_S
+    //     Q_BIAS_ESKF  = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S
+    //     R_THETA_ESKF = R_YAW_ENCODER    (measurement noise, unchanged)
+    // Q_POS_ESKF is new — set from observed odometry drift:
+    //     drift rate ~1 cm/m at 15 cm/s  →  var rate ~2.25e-6 m²/s
+    //     we choose a slightly conservative 1e-6 m²/s for smoothness.
+    // ------------------------------------------------------------------
+    constexpr float Q_POS_ESKF             = 1.00e-6f;                        // [m²/s]
+    constexpr float Q_THETA_ESKF           = Q_YAW_DISCRETE   / CONTROL_PERIOD_S;   // [rad²/s]
+    constexpr float Q_BIAS_ESKF            = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S;   // [(rad/s)²/s]
+    constexpr float R_THETA_ESKF           = R_YAW_ENCODER;                   // [rad²]
+
     constexpr float   IMU_OFFSET_LON_M       = 0.0516f;
     constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;
 
@@ -141,6 +175,23 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
+    // ------------------------------------------------------------------
+    // ESKF (local error-state Kalman filter, 4-state)
+    // ------------------------------------------------------------------
+    // q values are CONTINUOUS-TIME densities (per second), not per-step
+    // variances. They are derived from the discrete HKF values:
+    //     Q_THETA_ESKF = Q_YAW_DISCRETE   / CONTROL_PERIOD_S
+    //     Q_BIAS_ESKF  = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S
+    //     R_THETA_ESKF = R_YAW_ENCODER    (measurement noise, unchanged)
+    // Q_POS_ESKF is new — set from observed odometry drift:
+    //     drift rate ~1 cm/m at 15 cm/s  →  var rate ~2.25e-6 m²/s
+    //     we choose a slightly conservative 1e-6 m²/s for smoothness.
+    // ------------------------------------------------------------------
+    constexpr float Q_POS_ESKF             = 1.00e-6f;                        // [m²/s]
+    constexpr float Q_THETA_ESKF           = Q_YAW_DISCRETE   / CONTROL_PERIOD_S;   // [rad²/s]
+    constexpr float Q_BIAS_ESKF            = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S;   // [(rad/s)²/s]
+    constexpr float R_THETA_ESKF           = R_YAW_ENCODER;                   // [rad²]
+
     constexpr float   IMU_OFFSET_LON_M       = 0.0590f;
     constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;
 
@@ -174,6 +225,23 @@ namespace Config {
     constexpr float   Q_YAW_DISCRETE         = 6.92e-9f;
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
+
+    // ------------------------------------------------------------------
+    // ESKF (local error-state Kalman filter, 4-state)
+    // ------------------------------------------------------------------
+    // q values are CONTINUOUS-TIME densities (per second), not per-step
+    // variances. They are derived from the discrete HKF values:
+    //     Q_THETA_ESKF = Q_YAW_DISCRETE   / CONTROL_PERIOD_S
+    //     Q_BIAS_ESKF  = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S
+    //     R_THETA_ESKF = R_YAW_ENCODER    (measurement noise, unchanged)
+    // Q_POS_ESKF is new — set from observed odometry drift:
+    //     drift rate ~1 cm/m at 15 cm/s  →  var rate ~2.25e-6 m²/s
+    //     we choose a slightly conservative 1e-6 m²/s for smoothness.
+    // ------------------------------------------------------------------
+    constexpr float Q_POS_ESKF             = 1.00e-6f;                        // [m²/s]
+    constexpr float Q_THETA_ESKF           = Q_YAW_DISCRETE   / CONTROL_PERIOD_S;   // [rad²/s]
+    constexpr float Q_BIAS_ESKF            = Q_GYRO_BIAS_WALK / CONTROL_PERIOD_S;   // [(rad/s)²/s]
+    constexpr float R_THETA_ESKF           = R_YAW_ENCODER;                   // [rad²]
 
     constexpr float   IMU_OFFSET_LON_M       = 0.0578f;
     constexpr float   IMU_OFFSET_LAT_M       = 0.0000f;

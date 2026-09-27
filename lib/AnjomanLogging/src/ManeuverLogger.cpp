@@ -35,7 +35,7 @@ bool ManeuverLogger::commitToFlash(uint8_t maneuverId) {
     // 1. Header
     LogHeader header = {};
     memcpy(header.magic, "ANJM", 4);
-    header.version     = 1;
+    header.version     = 2;
     header.robotId     = Config::ID;
     header.maneuverId  = maneuverId;
     header.recordCount = (uint32_t)_recordCount;

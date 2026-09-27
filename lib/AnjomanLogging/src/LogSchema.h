@@ -3,13 +3,14 @@
 #include <Arduino.h>
 
 // ==============================================================================
-// Binary log file format for Anjoman maneuver recordings
+// Binary log format for Anjoman maneuver recordings — Version 2
 // ==============================================================================
 // Layout:
-//   [LogHeader] [LogRecord × N] [LogFooter]
-//   Header: 14 bytes
-//   Record: 68 bytes (see struct)
-//   Footer: 8 bytes (CRC32 + end magic)
+//   [LogHeader (14 B)] [LogRecord × N (184 B)] [LogFooter (8 B)]
+//
+// Version history:
+//   1 — Hub-and-spoke, single UWB peer per record (68 B)
+//   2 — Full mesh, three UWB peers per record (184 B)
 //
 // Endianness: little-endian on both writer (ESP32) and reader (Python)
 // ==============================================================================
@@ -18,54 +19,87 @@
 
 struct LogHeader {
     char     magic[4];       // "ANJM"
-    uint16_t version;        // 1
+    uint16_t version;        // 2
     uint8_t  robotId;        // Config::ID
     uint8_t  maneuverId;     // 1, 2, 3, ...
     uint32_t recordCount;    // N
     uint16_t recordSize;     // sizeof(LogRecord)
 };
 
+// ------------------------------------------------------------------------------
+// One UWB peer block (three of these per record, one per other robot)
+// ------------------------------------------------------------------------------
+struct UWBPeerBlock {
+    uint8_t  peerId;         // 1..4
+    uint8_t  ldeErr;         // LDE error flag (0/1)
+    uint16_t stdNoise;       // noise floor (EMI metric)
+    uint16_t fpAmpl1;        // first-path amplitude 1
+    uint16_t fpAmpl2;        // first-path amplitude 2
+    uint16_t cirPwr;         // channel impulse response power
+    float    rawDist;        // raw distance from this poll
+    float    cleanDist;      // bias + thermal corrected distance
+    float    rssi;           // received signal strength (dBm)
+    float    fpPower;        // first-path power (dBm)
+    float    respTemp;       // responder chip temperature (°C)
+};  // 30 bytes
+
 struct LogRecord {
-    uint32_t t_ms;           // Timestamp (ms since boot)
+    uint32_t t_ms;
 
-    // ---- Local odometry state ----
-    float    x;              // Odometry X (m)
-    float    y;              // Odometry Y (m)
-    float    heading;        // Heading theta (rad)
+    // ---- ESKF pose estimate ----
+    float    x;
+    float    y;
+    float    heading;
 
-    // ---- Commanded velocities ----
-    float    v_cmd;          // Command linear velocity (m/s)
-    float    omega_cmd;      // Command angular velocity (rad/s)
+    // ---- Commanded chassis velocities ----
+    float    v_cmd;
+    float    omega_cmd;
 
     // ---- Measured wheel speeds ----
-    float    rpm_l;          // Measured Left RPM
-    float    rpm_r;          // Measured Right RPM
+    float    rpm_l;
+    float    rpm_r;
 
     // ---- IMU ----
-    float    gyro_z;         // Gyroscope rate (rad/s)
+    float    gyro_z;
+    float    imu_temp_c;
+    float    imu_accel_x;
 
     // ---- Power ----
-    float    vbat;           // Battery voltage (V)
-    float    current_a;      // Motor current (A)
+    float    vbat;
+    float    current_a;
 
-    // ---- UWB ----
-    float    uwb_raw;        // Raw UWB range (m, after CFO compensation)
-    float    uwb_clean;      // Calibrated UWB range (m, after UWBPreprocessor)
-    float    uwb_rssi;       // RSSI (dBm)
-    float    uwb_fp_power;   // First path power (dBm)
-    uint16_t uwb_std_noise;  // Noise floor (EMI metric)
-    uint8_t  uwb_peer_id;    // Target peer (1..4)
-    uint8_t  uwb_lde_err;    // Leading edge error flag (0 or 1)
-    float    uwb_temp;       // Transceiver temperature (°C)
+    // ---- Motor detail ----
+    float    duty_l;
+    float    duty_r;
+    float    target_rpm_l;
+    float    target_rpm_r;
+
+    // ---- UWB: three peers ----
+    UWBPeerBlock uwb[3];
+    uint16_t     rxpacc;        // shared RX preamble accumulator count
+
+    // ---- ESKF covariance (diagonal) ----
+    float    eskf_var_x;
+    float    eskf_var_y;
+    float    eskf_var_theta;
+    float    eskf_var_bias;
+
+    // ---- TDMA state ----
+    uint32_t tdma_frame_id;
+    uint8_t  tdma_slot_index;
+    uint8_t  tdma_sync_lost;
+    uint8_t  maneuver_id;
+    uint8_t  robot_state;       // 0=idle, 1=running, 2=finished
 };
 
 struct LogFooter {
-    uint32_t crc32;          // CRC32 of payload (records only)
-    char     endMagic[4];    // "MJNA"
+    uint32_t crc32;
+    char     endMagic[4];       // "MJNA"
 };
 
 #pragma pack(pop)
 
-// Static assertion: LogRecord must be exactly 68 bytes
-static_assert(sizeof(LogRecord) == 68,
+static_assert(sizeof(UWBPeerBlock) == 30,
+              "UWBPeerBlock size mismatch");
+static_assert(sizeof(LogRecord) == 184,
               "LogRecord size mismatch — check struct packing");

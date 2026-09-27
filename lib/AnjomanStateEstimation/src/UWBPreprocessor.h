@@ -3,85 +3,97 @@
 #include <Arduino.h>
 
 // ==============================================================================
-// UWB Preprocessor — Deterministic bias + thermal correction
+// UWB Preprocessor — deterministic bias + thermal correction
 // ==============================================================================
-// This class removes the deterministic bias and temperature-driven drift
-// from the raw UWB range BEFORE it enters the Kalman filter.
+// Removes the deterministic bias and temperature-driven drift from the raw
+// UWB range BEFORE the measurement enters any Kalman filter.
 //
-// IMPORTANT: The bias and thermal tables below apply to the **RAW** distance:
+// Input convention:
+//   The tables below apply to the RAW distance:
+//       d_raw = ToF_raw_ticks × TIME_UNIT_SEC × c
+//   where ToF_raw_ticks = (tRound − tReply) / 2, WITHOUT CFO compensation.
 //
-//     d_raw = ToF_raw_ticks × TIME_UNIT_SEC × c
-//
-// where ToF_raw_ticks = (tRound − tReply) / 2, WITHOUT CFO compensation.
-//
-// Rationale:
-//   • The 2 m static calibration yielded these biases on dist_raw_m.
-//   • CFO compensation has shown a sign inconsistency during motion.
-//   • Using raw distance + explicit bias is more predictable.
-//
-// For diagnostics, both d_raw and d_cfo can be logged separately.
+// Calibration provenance:
+//   • All 12 directed links (2 m square, static, 10 min).
+//   • One numerical outlier was removed (dist_raw_m = −64650 m, R4→R3 link).
+//   • Additive model: d_meas = d_true + A_i + B_j + c, with sum(A)=sum(B)=0.
+//   • RMSE of static bias model: 13.83 cm.
+//   • THERMAL_B1/B2 are per-directed-link linear coefficients of the residual
+//     versus mean and differential chip temperature.
+//   • VARIANCE_POST_THERMAL is the residual variance after all corrections;
+//     used directly as the diagonal element of R in the EKF.
 // ==============================================================================
 
 class UWBPreprocessor {
 public:
     // -------------------------------------------------------------------------
-    // Static bias per directed link [m], applied to d_raw
+    // Static bias per directed link [m]
+    //   Row = initiator (0..3 → R1..R4)
+    //   Col = responder (0..3 → R1..R4)
     // -------------------------------------------------------------------------
-    // Row = initiator device index (0-based)
-    // Col = responder device index (0-based)
-    // Measured from the 2 m static square benchmark (12 directed links).
     static constexpr float BIAS_RAW[4][4] = {
-        //   →R1         →R2         →R3         →R4
-        {   0.0000f,   19.2418f,   21.6532f,   19.5407f },  // R1 outgoing
-        {  58.5328f,    0.0000f,   41.0874f,   39.3955f },  // R2 outgoing
-        {  55.7571f,   36.0566f,    0.0000f,   37.0840f },  // R3 outgoing
-        {  57.6726f,   38.2033f,   40.8134f,    0.0000f }   // R4 outgoing
+        //       → R1          → R2          → R3          → R4
+        {   0.00000f,   +19.08774f,   +21.59553f,   +19.74432f },  // R1
+        { +58.35179f,     0.00000f,   +41.25733f,   +39.40612f },  // R2
+        { +55.81512f,   +36.21287f,     0.00000f,   +36.86945f },  // R3
+        { +57.79520f,   +38.19295f,   +40.70074f,     0.00000f }   // R4
     };
 
     // -------------------------------------------------------------------------
-    // Thermal coefficient on the mean temperature: ΔT_avg = (T_i + T_j)/2 − T_ref
-    // Units: m / °C
+    // Thermal coefficient on mean temperature (m / °C)
+    //     ΔT_avg = (T_i + T_j)/2 − T_REF_AVG
     // -------------------------------------------------------------------------
     static constexpr float THERMAL_B1[4][4] = {
-        {   0.0000f,  -0.2466f,  -0.1787f,  -0.2430f },
-        {  +0.2990f,   0.0000f,  +0.1227f,  -0.0005f },
-        {  +0.0774f,  -0.1263f,   0.0000f,  -0.1332f },
-        {  +0.2767f,  -0.0087f,  +0.1091f,   0.0000f }
+        {   0.00000f,    -0.12035f,    -0.08478f,    -0.11822f },  // R1
+        {  +0.15341f,     0.00000f,    +0.06586f,    +0.00275f },  // R2
+        {  +0.04406f,    -0.05913f,     0.00000f,    -0.06319f },  // R3
+        {  +0.14169f,    -0.00125f,    +0.05830f,     0.00000f }   // R4
     };
 
     // -------------------------------------------------------------------------
-    // Thermal coefficient on the differential temperature: ΔT_diff = T_i − T_j
-    // Units: m / °C
+    // Thermal coefficient on differential temperature (m / °C)
+    //     ΔT_diff = T_i − T_j
     // -------------------------------------------------------------------------
     static constexpr float THERMAL_B2[4][4] = {
-        {   0.0000f,  -0.1664f,  -0.1072f,  -0.1723f },
-        {  -0.4949f,   0.0000f,  -0.0170f,  -0.0128f },
-        {  -0.3601f,  -0.0517f,   0.0000f,  -0.0709f },
-        {  -0.4920f,  -0.0094f,  -0.0225f,   0.0000f }
+        {   0.00000f,    -0.08322f,    -0.05545f,    -0.08763f },  // R1
+        {  -0.24521f,     0.00000f,    -0.00896f,    -0.00665f },  // R2
+        {  -0.17807f,    -0.02419f,     0.00000f,    -0.03515f },  // R3
+        {  -0.24585f,    -0.00549f,    -0.01183f,     0.00000f }   // R4
     };
 
+    // -------------------------------------------------------------------------
+    // Post-thermal measurement variance per directed link [m²]
+    //   Used as the diagonal element of R in the EKF.
+    //   Values reflect the observed residual σ after all corrections.
+    // -------------------------------------------------------------------------
+    static constexpr float VARIANCE_POST_THERMAL[4][4] = {
+        //       → R1          → R2          → R3          → R4
+        {   0.000000f,    0.068956f,    0.065759f,    0.072837f },  // R1
+        {   0.035141f,    0.000000f,    0.002154f,    0.001717f },  // R2
+        {   0.011790f,    0.001583f,    0.000000f,    0.000904f },  // R3
+        {   0.051209f,    0.001944f,    0.001129f,    0.000000f }   // R4
+    };
+
+    // -------------------------------------------------------------------------
     // Reference temperatures used during calibration
-    static constexpr float T_REF_AVG  = 48.6f;   // Mean fleet temperature during calibration
-    static constexpr float T_REF_DIFF = 0.0f;
+    // -------------------------------------------------------------------------
+    static constexpr float T_REF_AVG  = 46.7178f;
+    static constexpr float T_REF_DIFF =  0.0000f;
 
     // -------------------------------------------------------------------------
     // Apply the deterministic correction
-    // -------------------------------------------------------------------------
-    // @param initId     Device ID of the initiator (1..4)
-    // @param respId     Device ID of the responder (1..4)
-    // @param dRawM      RAW distance in meters (see file header for definition)
-    // @param tempInit   Initiator chip temperature [°C]
-    // @param tempResp   Responder chip temperature [°C]
-    //
-    // @return           Bias-corrected distance in meters (may be negative if
-    //                   d_raw is smaller than the bias — caller should handle)
     // -------------------------------------------------------------------------
     static float correctRawDistance(uint8_t initId, uint8_t respId,
                                     float dRawM,
                                     float tempInit, float tempResp);
 
     // -------------------------------------------------------------------------
-    // Diagnostics: returns the individual bias components for logging
+    // Return the post-thermal variance for a given link [m²]
+    // -------------------------------------------------------------------------
+    static float getVariance(uint8_t initId, uint8_t respId);
+
+    // -------------------------------------------------------------------------
+    // Diagnostic: return the individual bias components for logging
     // -------------------------------------------------------------------------
     struct CorrectionTerms {
         float biasStatic;   // [m]

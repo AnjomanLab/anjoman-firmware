@@ -36,6 +36,7 @@ public:
     void brake();
     void coast();
     void resetPID();
+    float getLastDuty() const { return _lastDuty; }
 
 private:
     uint8_t _pinIn1;

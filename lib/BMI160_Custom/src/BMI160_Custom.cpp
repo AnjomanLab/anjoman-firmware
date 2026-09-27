@@ -140,5 +140,12 @@ bool BMI160_Custom::readSensorData() {
     _gyroY = (float)gyroData.y / 16.4f;
     _gyroZ = (float)gyroData.z / 16.4f;
 
+    // ---- Temperature ----
+    uint8_t tempData[2];
+    if (bmi160_get_regs(0x20, tempData, 2, &_sensorDev) == BMI160_OK) {
+        int16_t rawTemp = (int16_t)((tempData[1] << 8) | tempData[0]);
+        _temperatureC = 23.0f + ((float)rawTemp / 512.0f);
+    }
+
     return true;
 }
