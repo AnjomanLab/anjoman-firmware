@@ -8,7 +8,7 @@
 class ManeuverLogger {
 public:
     // RAM buffer capacity — 300 records @ 68 bytes = 20.4 KB
-    static constexpr size_t MAX_RECORDS       = 300;
+    static constexpr size_t MAX_RECORDS       = 800;
     static constexpr const char* LOG_FILE_PATH = "/maneuver_log.bin";
 
     ManeuverLogger();

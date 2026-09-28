@@ -43,7 +43,33 @@ device_configuration_t UWB_CONFIG = {
 };
 
 // ==============================================================================
-// 2. HARDWARE SINGLETONS
+// 2. ACTIVE FLEET (subset for partial-fleet tests)
+// ==============================================================================
+// Deployment:             {1, 2, 3, 4}
+// 3-robot test (no R1):   {2, 3, 4}
+// 2-robot test:           {2, 3} (or any pair)
+constexpr uint8_t ACTIVE_ROBOTS[] = {2, 3, 4};
+constexpr uint8_t N_ACTIVE        = 3;
+
+static bool isActive(uint8_t id) {
+    for (uint8_t i = 0; i < N_ACTIVE; i++) {
+        if (ACTIVE_ROBOTS[i] == id) return true;
+    }
+    return false;
+}
+
+static uint8_t allPeersMaskForMe() {
+    uint8_t mask = 0;
+    for (uint8_t i = 0; i < N_ACTIVE; i++) {
+        if (ACTIVE_ROBOTS[i] != Config::ID) {
+            mask |= (1u << ACTIVE_ROBOTS[i]);
+        }
+    }
+    return mask;
+}
+
+// ==============================================================================
+// 3. HARDWARE SINGLETONS
 // ==============================================================================
 MotorController motorL(PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, Config::INVERT_MOTOR_LEFT);
 MotorController motorR(PIN_MOTOR_R_IN1, PIN_MOTOR_R_IN2, Config::INVERT_MOTOR_RIGHT);
@@ -59,11 +85,18 @@ ManeuverLogger  logger;
 TDMAEngine      tdma;
 
 // ==============================================================================
-// 3. DECENTRALIZED TDMA SLOT TABLE
+// 4. DECENTRALIZED TDMA SLOT TABLE
+// ==============================================================================
+// Slot groups (each robot owns 4 consecutive slots):
+//   slots 0..3   : R1 (beacon, →R2, →R3, →R4)
+//   slots 4..7   : R2 (beacon, →R1, →R3, →R4)
+//   slots 8..11  : R3 (beacon, →R1, →R2, →R4)
+//   slots 12..15 : R4 (beacon, →R1, →R2, →R3)
+// Slots whose actor is not in ACTIVE_ROBOTS are ignored by handleSlot.
 // ==============================================================================
 struct SlotAction {
-    uint8_t actor;      // 1..4 (transmitting robot), 0 = idle
-    uint8_t target;     // 0 for beacon, else responder ID
+    uint8_t actor;
+    uint8_t target;
     bool    isBeacon;
 };
 
@@ -75,7 +108,7 @@ static const SlotAction SLOT_TABLE[16] = {
 };
 
 // ==============================================================================
-// 4. SHARED STATE
+// 5. SHARED STATE
 // ==============================================================================
 struct SharedState {
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -99,7 +132,7 @@ struct SharedState {
 } g_shared;
 
 // ==============================================================================
-// 5. UWB METRICS PER PEER
+// 6. UWB METRICS PER PEER
 // ==============================================================================
 struct UWBMetrics {
     bool     valid;
@@ -122,14 +155,14 @@ uint16_t g_lastRxpacc = 0;
 float    g_cachedTempUwb = 25.0f;
 
 // ==============================================================================
-// 6. CONSENSUS STATE
+// 7. CONSENSUS STATE
 // ==============================================================================
 static uint8_t  g_peersSeenMask       = 0;
 static uint32_t g_candidateStartFrame = 0;
 static bool     g_maneuverTriggered   = false;
 
 // ==============================================================================
-// 7. UTILITIES
+// 8. UTILITIES
 // ==============================================================================
 inline void write40BitTime(uint8_t *dest, uint64_t val) {
     dest[0] = (uint8_t)(val & 0xFF);
@@ -148,7 +181,7 @@ inline uint64_t read40BitTime(const uint8_t *src) {
 }
 
 // ==============================================================================
-// 8. CORE 1 — 100 Hz real-time loop
+// 9. CORE 1 — 100 Hz real-time loop
 // ==============================================================================
 void Core1_ControlTask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -195,14 +228,14 @@ void Core1_ControlTask(void *pvParameters) {
         portENTER_CRITICAL(&g_shared.mux);
         const float targetV     = g_shared.vCommand;
         const float targetOmega = g_shared.omegaCommand;
-        const bool  isActive    = g_shared.maneuverRunning;
-        const bool  isFinished  = g_shared.maneuverFinished;
+        const bool  isActive_   = g_shared.maneuverRunning;
+        const bool  isFinished_ = g_shared.maneuverFinished;
         portEXIT_CRITICAL(&g_shared.mux);
 
         float dutyL = 0.0f, dutyR = 0.0f;
         float targetRpmL = 0.0f, targetRpmR = 0.0f;
 
-        if (!isActive || isFinished) {
+        if (!isActive_ || isFinished_) {
             motorL.brake();
             motorR.brake();
         } else {
@@ -240,7 +273,7 @@ void Core1_ControlTask(void *pvParameters) {
 }
 
 // ==============================================================================
-// 9. ESP-NOW
+// 10. ESP-NOW
 // ==============================================================================
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
     if (data_len != sizeof(SyncBeaconPacket)) return;
@@ -249,6 +282,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
     memcpy(&pkt, data, sizeof(pkt));
 
     if (pkt.senderId == Config::ID) return;
+    if (!isActive(pkt.senderId))     return;
 
     tdma.onSyncReceived(pkt.senderId,
                         pkt.frameId,
@@ -257,7 +291,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
                         millis(),
                         micros());
 
-    // Track peers and converge on maneuver start frame
     g_peersSeenMask |= (1u << pkt.senderId);
     if (pkt.maneuverStartFrame > g_candidateStartFrame) {
         g_candidateStartFrame = pkt.maneuverStartFrame;
@@ -284,7 +317,7 @@ void setupESPNow() {
 }
 
 // ==============================================================================
-// 10. UWB
+// 11. UWB
 // ==============================================================================
 void setupUWB() {
     pinMode(PIN_UWB_RST, OUTPUT);
@@ -308,6 +341,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
     if (targetPeerId < 1 || targetPeerId > 4 || targetPeerId == Config::ID) {
         return false;
     }
+    if (!isActive(targetPeerId)) return false;
 
     UWBPollPacket pollPkt = {};
     memcpy(pollPkt.header, "POLL", 4);
@@ -353,6 +387,13 @@ bool performRangingPoll(uint8_t targetPeerId) {
 
                     const int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
                     const int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
+
+                    // Guard against inverted timestamps (would produce
+                    // a negative ToF that wraps to ~1.2e9 m in the log).
+                    if (tReply >= tRound) {
+                        break;
+                    }
+
                     const int64_t tofRawTicks = (tRound - tReply) / 2;
                     const float distRawM = (float)(tofRawTicks * TIME_UNIT_SEC *
                                                    SPEED_OF_LIGHT);
@@ -390,7 +431,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
     return success;
 }
 
-// Blocking responder: listen for the entire slot window (up to 13 ms),
+// Blocking responder: listen for the entire slot window (up to timeoutMs),
 // so we are still receiving when the initiator's poll arrives mid-slot.
 bool performRangingListenBlocking(uint32_t timeoutMs) {
     DW1000Ng::forceTRxOff();
@@ -445,7 +486,7 @@ bool performRangingListenBlocking(uint32_t timeoutMs) {
                     break;
                 }
             }
-            // Not our poll; keep listening
+            // Not our poll; keep listening within this slot.
         }
 
         if (DW1000Ng::isReceiveFailed() || DW1000Ng::isReceiveTimeout()) {
@@ -460,7 +501,7 @@ bool performRangingListenBlocking(uint32_t timeoutMs) {
 }
 
 // ==============================================================================
-// 11. SLOT HANDLER AND BEACON
+// 12. SLOT HANDLER AND BEACON
 // ==============================================================================
 static void sendBeacon(uint8_t slot) {
     SyncBeaconPacket pkt = {};
@@ -475,6 +516,8 @@ static void sendBeacon(uint8_t slot) {
 static void handleSlot(uint32_t slot) {
     if (slot >= 16) return;
     const SlotAction &a = SLOT_TABLE[slot];
+
+    if (!isActive(a.actor)) return;
 
     if (a.isBeacon) {
         if (a.actor == Config::ID) {
@@ -492,7 +535,7 @@ static void handleSlot(uint32_t slot) {
 }
 
 // ==============================================================================
-// 12. SETUP
+// 13. SETUP
 // ==============================================================================
 void setup() {
     Serial.begin(460800);
@@ -547,13 +590,13 @@ void setup() {
 }
 
 // ==============================================================================
-// 13. CORE 0 LOOP
+// 14. CORE 0 LOOP
 // ==============================================================================
 void loop() {
     const uint32_t nowMs = millis();
     tdma.tick(nowMs, micros());
 
-    // ---- UWB temperature refresh ----
+    // ---- UWB temperature refresh (every 500 ms) ----
     static uint32_t lastTempMs = 0;
     if (nowMs - lastTempMs >= 500) {
         lastTempMs = nowMs;
@@ -565,9 +608,8 @@ void loop() {
 
     // ---- Consensus: propose a start frame once all peers have been seen ----
     if (g_candidateStartFrame == 0) {
-        const uint8_t selfBit    = (1u << Config::ID);
-        const uint8_t allPeers   = 0b11110u & ~selfBit;   // bits for 3 peers
-        if ((g_peersSeenMask & allPeers) == allPeers) {
+        const uint8_t requiredPeers = allPeersMaskForMe();
+        if ((g_peersSeenMask & requiredPeers) == requiredPeers) {
             g_candidateStartFrame = tdma.getFrameId() + 100;
         }
     }
@@ -643,7 +685,7 @@ void loop() {
     static uint32_t lastActedFrame = UINT32_MAX;
     static uint32_t lastActedSlot  = UINT32_MAX;
 
-    // ---- Log check (before the slot's blocking operations) ----
+    // ---- Log check (before blocking slot work) ----
     static uint32_t lastLoggedFrame = UINT32_MAX;
     const bool logArmed = g_shared.maneuverRunning && !g_shared.maneuverFinished;
     const uint32_t logTargetSlot = frame % 16;
@@ -681,15 +723,17 @@ void loop() {
         rec.vbat      = vBat;
         rec.current_a = iBat;
 
-        // UWB peer blocks
-        uint8_t peers[3];
+        // UWB peer blocks: only active peers (up to 3)
+        uint8_t peers[3] = {0, 0, 0};
         uint8_t pidx = 0;
-        for (uint8_t p = 1; p <= 4; p++) {
-            if (p == Config::ID) continue;
-            peers[pidx++] = p;
+        for (uint8_t i = 0; i < N_ACTIVE; i++) {
+            if (ACTIVE_ROBOTS[i] != Config::ID && pidx < 3) {
+                peers[pidx++] = ACTIVE_ROBOTS[i];
+            }
         }
 
         for (int i = 0; i < 3; i++) {
+            if (peers[i] == 0) continue;
             const UWBMetrics &m = g_uwbMetrics[peers[i]];
             UWBPeerBlock &blk = rec.uwb[i];
             blk.peerId    = peers[i];
