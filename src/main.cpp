@@ -20,7 +20,6 @@
 #include "UWBPreprocessor.h"
 #include "FormationReference.h"
 #include "FormationController.h"
-#include "ManeuverLogger.h"
 #include "TDMAEngine.h"
 
 // ==============================================================================
@@ -43,11 +42,8 @@ device_configuration_t UWB_CONFIG = {
 };
 
 // ==============================================================================
-// 2. ACTIVE FLEET (subset for partial-fleet tests)
+// 2. ACTIVE FLEET
 // ==============================================================================
-// Deployment:             {1, 2, 3, 4}
-// 3-robot test (no R1):   {2, 3, 4}
-// 2-robot test:           {2, 3} (or any pair)
 constexpr uint8_t ACTIVE_ROBOTS[] = {2, 3, 4};
 constexpr uint8_t N_ACTIVE        = 3;
 
@@ -81,18 +77,10 @@ BMI160_Custom   imu(Wire, 0x69, 2);
 INA226          power_monitor(Wire, 0x40, 3, Config::SHUNT_RESISTOR_OHM);
 
 ESKF            g_eskf;
-ManeuverLogger  logger;
 TDMAEngine      tdma;
 
 // ==============================================================================
-// 4. DECENTRALIZED TDMA SLOT TABLE
-// ==============================================================================
-// Slot groups (each robot owns 4 consecutive slots):
-//   slots 0..3   : R1 (beacon, →R2, →R3, →R4)
-//   slots 4..7   : R2 (beacon, →R1, →R3, →R4)
-//   slots 8..11  : R3 (beacon, →R1, →R2, →R4)
-//   slots 12..15 : R4 (beacon, →R1, →R2, →R3)
-// Slots whose actor is not in ACTIVE_ROBOTS are ignored by handleSlot.
+// 4. TDMA SLOT TABLE — 3-robot equilateral triangle
 // ==============================================================================
 struct SlotAction {
     uint8_t actor;
@@ -101,10 +89,14 @@ struct SlotAction {
 };
 
 static const SlotAction SLOT_TABLE[16] = {
-    {1, 0, true},  {1, 2, false}, {1, 3, false}, {1, 4, false},
-    {2, 0, true},  {2, 1, false}, {2, 3, false}, {2, 4, false},
-    {3, 0, true},  {3, 1, false}, {3, 2, false}, {3, 4, false},
-    {4, 0, true},  {4, 1, false}, {4, 2, false}, {4, 3, false},
+    // R2 owns slots 0-3
+    {2, 0, true},  {2, 3, false}, {2, 4, false}, {0, 0, false},
+    // R3 owns slots 4-7
+    {3, 0, true},  {3, 2, false}, {3, 4, false}, {0, 0, false},
+    // R4 owns slots 8-11
+    {4, 0, true},  {4, 2, false}, {4, 3, false}, {0, 0, false},
+    // Listen windows (margin slots)
+    {0, 0, false}, {0, 0, false}, {0, 0, false}, {0, 0, false},
 };
 
 // ==============================================================================
@@ -152,7 +144,6 @@ struct UWBMetrics {
 UWBMetrics g_uwbMetrics[5];
 
 uint16_t g_lastRxpacc = 0;
-float    g_cachedTempUwb = 25.0f;
 
 // ==============================================================================
 // 7. CONSENSUS STATE
@@ -181,7 +172,7 @@ inline uint64_t read40BitTime(const uint8_t *src) {
 }
 
 // ==============================================================================
-// 9. CORE 1 — 100 Hz real-time loop
+// 9. CORE 1 — 100 Hz REAL-TIME LOOP
 // ==============================================================================
 void Core1_ControlTask(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -379,7 +370,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
 
                 if (memcmp(respPkt.header, "RESP", 4) == 0 &&
                     respPkt.responderId == targetPeerId &&
-                    respPkt.targetId == Config::ID) {
+                    respPkt.targetId    == Config::ID) {
 
                     const uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
                     const uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
@@ -388,8 +379,6 @@ bool performRangingPoll(uint8_t targetPeerId) {
                     const int64_t tRound = (int64_t)((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
                     const int64_t tReply = (int64_t)((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
 
-                    // Guard against inverted timestamps (would produce
-                    // a negative ToF that wraps to ~1.2e9 m in the log).
                     if (tReply >= tRound) {
                         break;
                     }
@@ -399,8 +388,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
                                                    SPEED_OF_LIGHT);
 
                     const float cleanM = UWBPreprocessor::correctRawDistance(
-                        Config::ID, targetPeerId, distRawM,
-                        g_cachedTempUwb, respPkt.tempUwb);
+                        Config::ID, targetPeerId, distRawM, 0.0f, 0.0f);
 
                     const auto diag = DW1000Ng::getChannelDiagnostics();
 
@@ -417,7 +405,7 @@ bool performRangingPoll(uint8_t targetPeerId) {
                     m.cleanDist  = cleanM;
                     m.rssi       = (float)DW1000Ng::getReceivePower();
                     m.fpPower    = (float)DW1000Ng::getFirstPathPower();
-                    m.respTemp   = respPkt.tempUwb;
+                    m.respTemp   = 25.0f;
 
                     g_lastRxpacc = diag.rxpacc;
                     success = true;
@@ -431,8 +419,6 @@ bool performRangingPoll(uint8_t targetPeerId) {
     return success;
 }
 
-// Blocking responder: listen for the entire slot window (up to timeoutMs),
-// so we are still receiving when the initiator's poll arrives mid-slot.
 bool performRangingListenBlocking(uint32_t timeoutMs) {
     DW1000Ng::forceTRxOff();
     DW1000Ng::clearReceiveStatus();
@@ -466,7 +452,7 @@ bool performRangingListenBlocking(uint32_t timeoutMs) {
                     respPkt.sequence    = pollPkt.sequence;
                     write40BitTime(respPkt.rxTimestamp, tRx2);
                     write40BitTime(respPkt.txTimestamp, tTx2);
-                    respPkt.tempUwb     = g_cachedTempUwb;
+                    respPkt.tempUwb     = 25.0f;
                     respPkt.tempEsp     = 25.0f;
 
                     DW1000Ng::forceTRxOff();
@@ -486,7 +472,6 @@ bool performRangingListenBlocking(uint32_t timeoutMs) {
                     break;
                 }
             }
-            // Not our poll; keep listening within this slot.
         }
 
         if (DW1000Ng::isReceiveFailed() || DW1000Ng::isReceiveTimeout()) {
@@ -510,6 +495,36 @@ static void sendBeacon(uint8_t slot) {
     pkt.frameId            = tdma.getFrameId();
     pkt.senderUptimeMs     = millis();
     pkt.maneuverStartFrame = g_candidateStartFrame;
+
+    uint8_t idx = 0;
+    for (uint8_t i = 0; i < N_ACTIVE && idx < 2; i++) {
+        const uint8_t p = ACTIVE_ROBOTS[i];
+        if (p == Config::ID) continue;
+
+        const UWBMetrics &m = g_uwbMetrics[p];
+        if (!m.valid) continue;
+
+        UWBBeaconEntry &e = pkt.peers[idx];
+        e.peerId    = p;
+        e.ldeErr    = m.ldeErr;
+        e.rawDist   = m.rawDist;
+        e.cleanDist = m.cleanDist;
+        e.rssi      = m.rssi;
+        e.fpPower   = m.fpPower;
+        e.respTemp  = m.respTemp;
+        idx++;
+    }
+    pkt.nPeers = idx;
+
+    static float    lastVbat   = 7.4f;
+    static uint32_t lastVbatMs = 0;
+    if (millis() - lastVbatMs >= 1000) {
+        lastVbatMs = millis();
+        float v, i, pwr;
+        if (power_monitor.read(v, i, pwr)) lastVbat = v;
+    }
+    pkt.vbat = lastVbat;
+
     esp_now_send(BROADCAST_MAC, (uint8_t*)&pkt, sizeof(pkt));
 }
 
@@ -531,7 +546,6 @@ static void handleSlot(uint32_t slot) {
     } else if (a.target == Config::ID) {
         performRangingListenBlocking(13);
     }
-    // else: idle for this slot
 }
 
 // ==============================================================================
@@ -571,7 +585,6 @@ void setup() {
     setupESPNow();
     setupUWB();
 
-    logger.init();
     tdma.init(Config::ID);
 
     for (int i = 0; i < 5; i++) g_uwbMetrics[i] = UWBMetrics{};
@@ -595,16 +608,6 @@ void setup() {
 void loop() {
     const uint32_t nowMs = millis();
     tdma.tick(nowMs, micros());
-
-    // ---- UWB temperature refresh (every 500 ms) ----
-    static uint32_t lastTempMs = 0;
-    if (nowMs - lastTempMs >= 500) {
-        lastTempMs = nowMs;
-        const float t = DW1000Ng::getTemperature();
-        if (t > -30.0f && t < 90.0f) {
-            g_cachedTempUwb = t;
-        }
-    }
 
     // ---- Consensus: propose a start frame once all peers have been seen ----
     if (g_candidateStartFrame == 0) {
@@ -655,8 +658,6 @@ void loop() {
                 g_shared.robotState       = 2;
                 portEXIT_CRITICAL(&g_shared.mux);
 
-                logger.commitToFlash(1);
-                logger.startDownloadServer();
                 neopixelWrite(PIN_STATUS_RGB, 0, 0, 50);
             } else {
                 const FormationState2D target =
@@ -674,10 +675,6 @@ void loop() {
         }
     }
 
-    if (g_shared.maneuverFinished) {
-        logger.handleClient();
-    }
-
     // ---- Slot execution ----
     const uint32_t frame = tdma.getFrameId();
     const uint32_t slot  = tdma.getCurrentSlotIndex();
@@ -685,80 +682,6 @@ void loop() {
     static uint32_t lastActedFrame = UINT32_MAX;
     static uint32_t lastActedSlot  = UINT32_MAX;
 
-    // ---- Log check (before blocking slot work) ----
-    static uint32_t lastLoggedFrame = UINT32_MAX;
-    const bool logArmed = g_shared.maneuverRunning && !g_shared.maneuverFinished;
-    const uint32_t logTargetSlot = frame % 16;
-
-    if (logArmed && frame != lastLoggedFrame && slot == logTargetSlot) {
-        lastLoggedFrame = frame;
-
-        LogRecord rec = {};
-
-        portENTER_CRITICAL(&g_shared.mux);
-        rec.t_ms            = nowMs;
-        rec.x               = g_shared.posX;
-        rec.y               = g_shared.posY;
-        rec.heading         = g_shared.headingRad;
-        rec.v_cmd           = g_shared.vCommand;
-        rec.omega_cmd       = g_shared.omegaCommand;
-        rec.rpm_l           = g_shared.rpmL;
-        rec.rpm_r           = g_shared.rpmR;
-        rec.gyro_z          = g_shared.gyroZ;
-        rec.imu_temp_c      = g_shared.imuTempC;
-        rec.imu_accel_x     = g_shared.accelX;
-        rec.eskf_var_x      = g_shared.eskfVarX;
-        rec.eskf_var_y      = g_shared.eskfVarY;
-        rec.eskf_var_theta  = g_shared.eskfVarTheta;
-        rec.eskf_var_bias   = g_shared.eskfVarBias;
-        rec.duty_l          = g_shared.dutyL;
-        rec.duty_r          = g_shared.dutyR;
-        rec.target_rpm_l    = g_shared.targetRpmL;
-        rec.target_rpm_r    = g_shared.targetRpmR;
-        rec.robot_state     = g_shared.robotState;
-        portEXIT_CRITICAL(&g_shared.mux);
-
-        float vBat = 7.4f, iBat = 0.0f, pBat = 0.0f;
-        power_monitor.read(vBat, iBat, pBat);
-        rec.vbat      = vBat;
-        rec.current_a = iBat;
-
-        // UWB peer blocks: only active peers (up to 3)
-        uint8_t peers[3] = {0, 0, 0};
-        uint8_t pidx = 0;
-        for (uint8_t i = 0; i < N_ACTIVE; i++) {
-            if (ACTIVE_ROBOTS[i] != Config::ID && pidx < 3) {
-                peers[pidx++] = ACTIVE_ROBOTS[i];
-            }
-        }
-
-        for (int i = 0; i < 3; i++) {
-            if (peers[i] == 0) continue;
-            const UWBMetrics &m = g_uwbMetrics[peers[i]];
-            UWBPeerBlock &blk = rec.uwb[i];
-            blk.peerId    = peers[i];
-            blk.ldeErr    = m.valid ? m.ldeErr    : 0;
-            blk.stdNoise  = m.valid ? m.stdNoise  : 0;
-            blk.fpAmpl1   = m.valid ? m.fpAmpl1   : 0;
-            blk.fpAmpl2   = m.valid ? m.fpAmpl2   : 0;
-            blk.cirPwr    = m.valid ? m.cirPwr    : 0;
-            blk.rawDist   = m.valid ? m.rawDist   : 0.0f;
-            blk.cleanDist = m.valid ? m.cleanDist : 0.0f;
-            blk.rssi      = m.valid ? m.rssi      : 0.0f;
-            blk.fpPower   = m.valid ? m.fpPower   : 0.0f;
-            blk.respTemp  = m.valid ? m.respTemp  : 0.0f;
-        }
-        rec.rxpacc = g_lastRxpacc;
-
-        rec.tdma_frame_id   = frame;
-        rec.tdma_slot_index = (uint8_t)slot;
-        rec.tdma_sync_lost  = tdma.isSyncLost() ? 1 : 0;
-        rec.maneuver_id     = 1;
-
-        logger.record(rec);
-    }
-
-    // ---- Slot execution (once per slot change) ----
     if (frame != lastActedFrame || slot != lastActedSlot) {
         lastActedFrame = frame;
         lastActedSlot  = slot;
