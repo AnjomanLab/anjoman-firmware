@@ -45,9 +45,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__AVR__)
-	#include <EEPROM.h>
-#endif
 #include "DW1000Ng.hpp"
 #include "DW1000NgUtils.hpp"
 #include "DW1000NgConstants.hpp"
@@ -193,20 +190,19 @@ namespace DW1000Ng {
 			uint8_t headerLen = 1;
 			
 			// build SPI header
-			if(offset == NO_SUB) {
-				header[0] = READ | cmd;
+			if (offset == NO_SUB) {
+			header[0] = READ | (cmd & 0x3F); // یا WRITE در متد نوشتن
 			} else {
-				header[0] = READ_SUB | cmd;
-				if(offset < 128) {
-					header[1] = (byte)offset;
-					headerLen++;
-				} else {
-					header[1] = RW_SUB_EXT | (byte)offset;
-					header[2] = (byte)(offset >> 7);
-					headerLen += 2;
-				}
+					header[0] = READ_SUB | (cmd & 0x3F);
+					if (offset < 128) {
+							header[1] = (byte)(offset & 0x7F);
+							headerLen++;
+					} else {
+							header[1] = RW_SUB_EXT | (byte)(offset & 0x7F);
+							header[2] = (byte)((offset >> 7) & 0xFF);
+							headerLen += 2;
+					}
 			}
-
 			SPIporting::readFromSPI(_ss, headerLen, header, data_size, data);
 		}
 
@@ -289,13 +285,34 @@ namespace DW1000Ng {
 		}
 		
 		/* Steps used to get Temp and Voltage */
-		void _vbatAndTempSteps() {
-			byte step1 = 0x80; _writeBytesToRegister(RF_CONF, 0x11, &step1, 1);
-			byte step2 = 0x0A; _writeBytesToRegister(RF_CONF, 0x12, &step2, 1);
-			byte step3 = 0x0F; _writeBytesToRegister(RF_CONF, 0x12, &step3, 1);
-			byte step4 = 0x01; _writeBytesToRegister(TX_CAL, NO_SUB, &step4, 1);
-			byte step5 = 0x00; _writeBytesToRegister(TX_CAL, NO_SUB, &step5, 1);
-		}
+	void _vbatAndTempSteps() {
+    SPIporting::setSPIspeed(SPIClock::SLOW);
+
+    // 1. Force System Clock to XTI to ensure analog block is powered
+    byte pmscctrl0[LEN_PMSC_CTRL0];
+    _readBytesFromRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, LEN_PMSC_CTRL0);
+    byte origClock = pmscctrl0[0];
+    pmscctrl0[0] = (origClock & 0xFC) | 0x01; // Force 19.2 MHz XTI
+    _writeBytesToRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
+    delayMicroseconds(10);
+
+    // 2. Table 14 Official SAR conversion excitation
+    byte step1 = 0x80; _writeBytesToRegister(RF_CONF, 0x11, &step1, 1);
+    byte step2 = 0x0A; _writeBytesToRegister(RF_CONF, 0x12, &step2, 1);
+    byte step3 = 0x0F; _writeBytesToRegister(RF_CONF, 0x12, &step3, 1);
+
+    // 3. Pulse SAR_CTRL in TC_SARC (reg 0x2A, sub 0x00)
+    byte step4 = 0x01; _writeBytesToRegister(TX_CAL, TC_SARC_SUB, &step4, 1);
+    delayMicroseconds(20);
+
+    byte step5 = 0x00; _writeBytesToRegister(TX_CAL, TC_SARC_SUB, &step5, 1);
+    delayMicroseconds(20);
+
+    // 4. Restore original system clock state
+    pmscctrl0[0] = origClock;
+    _writeBytesToRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
+}
+
 
 		/* AGC_TUNE1 - reg:0x23, sub-reg:0x04, table 24 */
 		void _agctune1() {
@@ -1096,22 +1113,21 @@ namespace DW1000Ng {
 			_writeBytesToRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
 		}
 
-		/* Crystal calibration from OTP (if available)
-		* FS_XTALT - reg:0x2B, sub-reg:0x0E
-		* OTP(one-time-programmable) memory map - table 10 */
-		void _fsxtalt() {
-			byte fsxtalt[LEN_FS_XTALT];
-			byte buf_otp[4];
-			_readBytesOTP(0x01E, buf_otp); //0x01E -> byte[0]=XTAL_Trim
-			if (buf_otp[0] == 0) {
-				// No trim value available from OTP, use midrange value of 0x10
-				DW1000NgUtils::writeValueToBytes(fsxtalt, ((0x10 & 0x1F) | 0x60), LEN_FS_XTALT);
-			} else {
-				DW1000NgUtils::writeValueToBytes(fsxtalt, ((buf_otp[0] & 0x1F) | 0x60), LEN_FS_XTALT);
+			/* Crystal calibration from OTP (FS_XTALT - reg:0x2B, sub-reg:0x0E) */
+			void _fsxtalt() {
+					byte fsxtalt[LEN_FS_XTALT];
+					byte buf_otp[4];
+					_readBytesOTP(0x01E, buf_otp); // Address 0x01E -> byte[0] = XTAL_Trim
+					
+					if (buf_otp[0] == 0) {
+							// Fallback to midrange value if OTP is unprogrammed
+							DW1000NgUtils::writeValueToBytes(fsxtalt, ((0x10 & 0x1F) | 0x60), LEN_FS_XTALT);
+					} else {
+							// Load factory calibrated trim (5-bits) with 0b011 in 3 MSBs
+							DW1000NgUtils::writeValueToBytes(fsxtalt, ((buf_otp[0] & 0x1F) | 0x60), LEN_FS_XTALT);
+					}
+					_writeBytesToRegister(FS_CTRL, FS_XTALT_SUB, fsxtalt, LEN_FS_XTALT);
 			}
-			// write configuration back to chip
-			_writeBytesToRegister(FS_CTRL, FS_XTALT_SUB, fsxtalt, LEN_FS_XTALT);
-		}
 
 		void _clearReceiveStatus() {
 			// clear latched RX bits (i.e. write 1 to clear)
@@ -1663,28 +1679,36 @@ namespace DW1000Ng {
 	}
 
 	float getTemperature() {
-		_vbatAndTempSteps();
-		byte sar_ltemp = 0; _readBytesFromRegister(TX_CAL, 0x04, &sar_ltemp, 1);
-		return (sar_ltemp - _tmeas23C) * 1.14f + 23.0f;
-	}
+    _vbatAndTempSteps();
+    byte sar_ltemp = 0; 
+    _readBytesFromRegister(TX_CAL, SAR_LTEMP_SUB, &sar_ltemp, 1);
+    SPIporting::setSPIspeed(SPIClock::FAST);
 
-	float getBatteryVoltage() {
-		_vbatAndTempSteps();
-		byte sar_lvbat = 0; _readBytesFromRegister(TX_CAL, 0x03, &sar_lvbat, 1);
-		return (sar_lvbat - _vmeas3v3) / 173.0f + 3.3f;
-	}
+    if (sar_ltemp == 0) return 0.0f;
+    return (static_cast<float>(sar_ltemp) - static_cast<float>(_tmeas23C)) * 1.14f + 23.0f;
+}
 
-	void getTemperatureAndBatteryVoltage(float& temp, float& vbat) {
-		// follow the procedure from section 6.4 of the User Manual
-		_vbatAndTempSteps();
-		delay(1);
-		byte sar_lvbat = 0; _readBytesFromRegister(TX_CAL, 0x03, &sar_lvbat, 1);
-		byte sar_ltemp = 0; _readBytesFromRegister(TX_CAL, 0x04, &sar_ltemp, 1);
-		
-		// calculate voltage and temperature
-		vbat = (sar_lvbat - _vmeas3v3) / 173.0f + 3.3f;
-		temp = (sar_ltemp - _tmeas23C) * 1.14f + 23.0f;
-	}
+float getBatteryVoltage() {
+    _vbatAndTempSteps();
+    byte sar_lvbat = 0; 
+    _readBytesFromRegister(TX_CAL, SAR_LVBAT_SUB, &sar_lvbat, 1);
+    SPIporting::setSPIspeed(SPIClock::FAST);
+
+    if (sar_lvbat == 0) return 0.0f;
+    return (static_cast<float>(sar_lvbat) - static_cast<float>(_vmeas3v3)) / 173.0f + 3.3f;
+}
+
+void getTemperatureAndBatteryVoltage(float& temp, float& vbat) {
+    _vbatAndTempSteps();
+    byte sar_lvbat = 0; 
+    byte sar_ltemp = 0;
+    _readBytesFromRegister(TX_CAL, SAR_LVBAT_SUB, &sar_lvbat, 1);
+    _readBytesFromRegister(TX_CAL, SAR_LTEMP_SUB, &sar_ltemp, 1);
+    SPIporting::setSPIspeed(SPIClock::FAST);
+
+    vbat = (static_cast<float>(sar_lvbat) - static_cast<float>(_vmeas3v3)) / 173.0f + 3.3f;
+    temp = (static_cast<float>(sar_ltemp) - static_cast<float>(_tmeas23C)) * 1.14f + 23.0f;
+}
 
 	void enableFrameFiltering(frame_filtering_configuration_t config) {
 		DW1000NgUtils::setBit(_syscfg, LEN_SYS_CFG, FFEN_BIT, true);
@@ -1714,26 +1738,6 @@ namespace DW1000Ng {
 		_antennaRxDelay = value;
 		_writeAntennaDelayRegisters();
 	}
-
-	#if defined(__AVR__)
-		void setAndSaveAntennaDelay(uint16_t delay, uint8_t eeAddress) {
-			EEPROM.put(eeAddress, delay);
-			EEPROM.end();
-			setAntennaDelay(delay);
-		}
-
-		uint16_t getSavedAntennaDelay(uint8_t eeAddress) {
-			uint16_t delay;
-			EEPROM.get(eeAddress, delay);
-			EEPROM.end();
-			return delay;
-		}
-
-		uint16_t setAntennaDelayFromEEPROM(uint8_t eeAddress) {
-			uint16_t delay = getSavedAntennaDelay(eeAddress);
-			setAntennaDelay(delay);
-		}
-	#endif
 
 	void setTxAntennaDelay(uint16_t value) {
 		_antennaTxDelay = value;
@@ -1767,16 +1771,27 @@ namespace DW1000Ng {
 	}
 
 	void startTransmit(TransmitMode mode) {
-		memset(_sysctrl, 0, LEN_SYS_CTRL);
-		DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, SFCST_BIT, !_frameCheck);
-		if(mode == TransmitMode::DELAYED)
-			DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, TXDLYS_BIT, true);
-		if(_wait4resp)
-			DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, WAIT4RESP_BIT, true);
+    memset(_sysctrl, 0, LEN_SYS_CTRL);
+    DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, SFCST_BIT, !_frameCheck);
 
-		DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, TXSTRT_BIT, true);
-		_writeBytesToRegister(SYS_CTRL, NO_SUB, _sysctrl, LEN_SYS_CTRL);
-	}
+    if (mode == TransmitMode::DELAYED) {
+        // Errata TX-1 Workaround: Force TX clock on before issuing delayed transmit command
+        byte pmscctrl0[LEN_PMSC_CTRL0];
+        _readBytesFromRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, LEN_PMSC_CTRL0);
+        pmscctrl0[0] &= 0xCF;
+        pmscctrl0[0] |= 0x10; // Force TX clock PLL on
+        _writeBytesToRegister(PMSC, PMSC_CTRL0_SUB, pmscctrl0, 2);
+
+        DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, TXDLYS_BIT, true);
+    }
+
+    if (_wait4resp) {
+        DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, WAIT4RESP_BIT, true);
+    }
+
+    DW1000NgUtils::setBit(_sysctrl, LEN_SYS_CTRL, TXSTRT_BIT, true);
+    _writeBytesToRegister(SYS_CTRL, NO_SUB, _sysctrl, LEN_SYS_CTRL);
+}
 
 	void setInterruptPolarity(boolean val) {
 		DW1000NgUtils::setBit(_syscfg, LEN_SYS_CFG, HIRQ_POL_BIT, val);
@@ -2158,59 +2173,62 @@ namespace DW1000Ng {
 
 
 int32_t getCarrierIntegrator() {
-        byte data[LEN_DRX_CAR_INT];
-        _readBytesFromRegister(DRX_TUNE, DRX_CAR_INT_SUB, data, LEN_DRX_CAR_INT);
+    byte data[LEN_DRX_CAR_INT];
+    _readBytesFromRegister(DRX_TUNE, DRX_CAR_INT_SUB, data, LEN_DRX_CAR_INT);
 
-        int32_t car_int = (int32_t)data[0] | 
-                          ((int32_t)data[1] << 8) | 
-                          ((int32_t)(data[2] & 0x1F) << 16);
+    int32_t car_int = (int32_t)data[0] | 
+                      ((int32_t)data[1] << 8) | 
+                      ((int32_t)(data[2] & 0x1F) << 16);
 
-        // Sign-extend 21-bit two's complement to 32-bit signed integer
-        if (car_int & 0x00100000) {
-            car_int |= 0xFFE00000;
-        }
-        return car_int;
+    // Sign-extend 21-bit two's complement to 32-bit signed integer
+    if (car_int & 0x00100000) {
+        car_int |= 0xFFE00000;
     }
+    return car_int;
+}
 
-
-    float getClockOffsetRatio() {
-        // Official Decawave factor for Channel 5 (fc = 6489.6 MHz, N = 1024):
-        // FreqOffset(Hz) = CarrierIntegrator * (998.4e6 / (2.0 * 1024.0 * 131072.0)) = CarrierIntegrator * 3.71933
-        // ClockOffsetRatio = -(FreqOffset / 6489.6e6) = CarrierIntegrator * (-5.73122e-10)
-        int32_t car_int = getCarrierIntegrator();
-        return (float)car_int * (-5.7312205e-10f);
-    }
+float getClockOffsetRatio() {
+    // Official Decawave calculation:
+    // FreqOffset(Hz) = CarrierIntegrator * (998.4e6 / (2.0 * 1024.0 * 131072.0))
+    // Ratio = FreqOffset / CenterFrequency
+    // For Channel 5 (fc = 6489.6 MHz):
+    // Ratio = CarrierIntegrator * (3.71933 / 6489.6e6) = CarrierIntegrator * (+5.73122e-10)
+    int32_t car_int = getCarrierIntegrator();
+    return (float)car_int * (5.7312205e-10f);
+}
 
     float getClockOffsetPPM() {
         return getClockOffsetRatio() * 1.0e6f;
     }
 
 ChannelDiagnostics getChannelDiagnostics() {
-        ChannelDiagnostics diag = {};
+    ChannelDiagnostics diag = {};
 
-        byte sysStatus[5];
-        _readBytesFromRegister(SYS_STATUS, 0x00, sysStatus, 5);
-        diag.ldeError = (sysStatus[2] & 0x04) ? 1 : 0; // Bit 18 is LDEERR
+    byte sysStatus[5];
+    _readBytesFromRegister(SYS_STATUS, NO_SUB, sysStatus, LEN_SYS_STATUS);
 
-        byte fqual[8];
-        _readBytesFromRegister(RX_FQUAL, 0x00, fqual, 8);
-        diag.stdNoise = (uint16_t)fqual[0] | ((uint16_t)fqual[1] << 8);
-        diag.fpAmpl2  = (uint16_t)fqual[2] | ((uint16_t)fqual[3] << 8);
-        diag.fpAmpl3  = (uint16_t)fqual[4] | ((uint16_t)fqual[5] << 8);
-        diag.cirPwr   = (uint16_t)fqual[6] | ((uint16_t)fqual[7] << 8);
+    // Bit 18 is LDEERR. It resides in byte index 2 (bits 16..23), bit position 2 (0x04)
+    diag.ldeError = (sysStatus[2] & 0x04) ? 1 : 0;
 
-        byte fpa1[2];
-        _readBytesFromRegister(RX_TIME, 0x07, fpa1, 2);
-        diag.fpAmpl1  = (uint16_t)fpa1[0] | ((uint16_t)fpa1[1] << 8);
+    byte fqual[8];
+    _readBytesFromRegister(RX_FQUAL, NO_SUB, fqual, LEN_RX_FQUAL);
+    diag.stdNoise = (uint16_t)fqual[0] | ((uint16_t)fqual[1] << 8);
+    diag.fpAmpl2  = (uint16_t)fqual[2] | ((uint16_t)fqual[3] << 8);
+    diag.fpAmpl3  = (uint16_t)fqual[4] | ((uint16_t)fqual[5] << 8);
+    diag.cirPwr   = (uint16_t)fqual[6] | ((uint16_t)fqual[7] << 8);
 
-        byte finfo[4];
-        _readBytesFromRegister(RX_FINFO, 0x00, finfo, 4);
-        uint32_t rawFinfo = (uint32_t)finfo[0] | ((uint32_t)finfo[1] << 8) | 
-                            ((uint32_t)finfo[2] << 16) | ((uint32_t)finfo[3] << 24);
-        diag.rxpacc   = (uint16_t)((rawFinfo >> 20) & 0x0FFF);
+    byte fpa1[2];
+    _readBytesFromRegister(RX_TIME, FP_AMPL1_SUB, fpa1, LEN_FP_AMPL1);
+    diag.fpAmpl1  = (uint16_t)fpa1[0] | ((uint16_t)fpa1[1] << 8);
 
-        return diag;
-    }
+    byte finfo[4];
+    _readBytesFromRegister(RX_FINFO, NO_SUB, finfo, LEN_RX_FINFO);
+    uint32_t rawFinfo = (uint32_t)finfo[0] | ((uint32_t)finfo[1] << 8) |
+                        ((uint32_t)finfo[2] << 16) | ((uint32_t)finfo[3] << 24);
+    diag.rxpacc   = (uint16_t)((rawFinfo >> 20) & 0x0FFF);
+
+    return diag;
+}
 
 
 }

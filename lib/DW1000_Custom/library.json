@@ -1,7 +1,7 @@
 {
   "name": "DW1000_Custom",
-  "version": "1.0.0",
-  "description": "Custom Decawave DW1000 driver with carrier integrator clock-offset compensation for Anjoman Swarm",
+  "version": "2.0.0",
+  "description": "Hardened DW1000/DWM1000 driver for ESP32-S3 with Table-14 SAR thermal conversion, dynamic SPI clock downscaling, carrier integrator diagnostics, and 40-bit timestamp unwrapping",
   "frameworks": "arduino",
   "platforms": "espressif32"
 }

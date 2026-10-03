@@ -21,7 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * 
- * @file SPIporting.hpp
+ * @file SPIporting.cpp
  * Arduino porting for the SPI interface.
 */
 
@@ -29,34 +29,27 @@
 #include <SPI.h>
 #include "SPIporting.hpp"
 #include "DW1000NgConstants.hpp"
-#include "DW1000NgRegisters.hpp"
+#include "DW1000NgRegisters.hpp" // IWYU pragma: keep
 
-    
 static SPIClass *_spi;
 
 namespace SPIporting {
 	
 	namespace {
 
-		constexpr uint32_t EspSPImaximumSpeed = 20000000; //20MHz
-		constexpr uint32_t ArduinoSPImaximumSpeed = 16000000; //16MHz
-		constexpr uint32_t SPIminimumSpeed = 2000000; //2MHz
+		constexpr uint32_t EspSPImaximumSpeed = 16000000; // 16 MHz safe fast bus
+		constexpr uint32_t SPIminimumSpeed    = 2000000;  // 2 MHz safe slow bus (< 3 MHz limit)
 
-		/* SPI relative variables */
-		#if defined(ESP32) || defined(ESP8266)
-			const SPISettings _fastSPI = SPISettings(EspSPImaximumSpeed, MSBFIRST, SPI_MODE0);
-		#else
-			const SPISettings _fastSPI = SPISettings(ArduinoSPImaximumSpeed, MSBFIRST, SPI_MODE0);
-		#endif
+		const SPISettings _fastSPI = SPISettings(EspSPImaximumSpeed, MSBFIRST, SPI_MODE0);
 		const SPISettings _slowSPI = SPISettings(SPIminimumSpeed, MSBFIRST, SPI_MODE0);
 		const SPISettings* _currentSPI = &_fastSPI;
 
-		void _openSPI(uint8_t slaveSelectPIN) {
+		inline void _openSPI(uint8_t slaveSelectPIN) {
 			_spi->beginTransaction(*_currentSPI);
 			digitalWrite(slaveSelectPIN, LOW);
 		}
 
-    	void _closeSPI(uint8_t slaveSelectPIN) {
+    	inline void _closeSPI(uint8_t slaveSelectPIN) {
 			digitalWrite(slaveSelectPIN, HIGH);
 			_spi->endTransaction();
 		}
@@ -64,7 +57,6 @@ namespace SPIporting {
 
 	void SPIinit(SPIClass &spi) {
 		_spi = &spi;
-		_spi->begin();
 	}
 
 	void SPIend() {
@@ -82,34 +74,34 @@ namespace SPIporting {
 
 	void writeToSPI(uint8_t slaveSelectPIN, uint8_t headerLen, byte header[], uint16_t dataLen, byte data[]) {
 		_openSPI(slaveSelectPIN);
-		for(auto i = 0; i < headerLen; i++) {
-			_spi->transfer(header[i]); // send header
+		for(auto i = 0; i < headerLen; ++i) {
+			_spi->transfer(header[i]);
 		}
-		for(auto i = 0; i < dataLen; i++) {
-			_spi->transfer(data[i]); // write values
+		for(auto i = 0; i < dataLen; ++i) {
+			_spi->transfer(data[i]);
 		}
-		delayMicroseconds(5);
+		delayMicroseconds(1);
 		_closeSPI(slaveSelectPIN);
 	}
 
-    void readFromSPI(uint8_t slaveSelectPIN, uint8_t headerLen, byte header[], uint16_t dataLen, byte data[]){
+    void readFromSPI(uint8_t slaveSelectPIN, uint8_t headerLen, byte header[], uint16_t dataLen, byte data[]) {
 		_openSPI(slaveSelectPIN);
-		for(auto i = 0; i < headerLen; i++) {
-			_spi->transfer(header[i]); // send header
+		for(auto i = 0; i < headerLen; ++i) {
+			_spi->transfer(header[i]);
 		}
-		for(auto i = 0; i < dataLen; i++) {
-			data[i] = _spi->transfer(0x00); // read values
+		for(auto i = 0; i < dataLen; ++i) {
+			data[i] = _spi->transfer(0x00);
 		}
-		delayMicroseconds(5);
+		delayMicroseconds(1);
 		_closeSPI(slaveSelectPIN);
 	}
 
 	void setSPIspeed(SPIClock speed) {
 		if(speed == SPIClock::FAST) {
 			_currentSPI = &_fastSPI;
-		 } else if(speed == SPIClock::SLOW) {
+		} else if(speed == SPIClock::SLOW) {
 			_currentSPI = &_slowSPI;
-		 }
+		}
 	}
 
 }

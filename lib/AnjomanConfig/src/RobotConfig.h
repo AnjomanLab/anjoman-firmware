@@ -8,11 +8,11 @@
 #endif
 
 namespace Config {
-
+    
     // ==============================================================================
     // 1. FLEET-WIDE PHYSICAL SPECIFICATIONS
     // ==============================================================================
-    constexpr uint8_t  FLEET_SIZE            = 4;
+    constexpr uint8_t  FLEET_SIZE            = 3;
     constexpr float    GEAR_RATIO            = 120.0f;
     constexpr float    WHEEL_DIAMETER_M      = 0.0537f;
     constexpr float    WHEEL_RADIUS_M        = WHEEL_DIAMETER_M / 2.0f;
@@ -42,6 +42,16 @@ namespace Config {
     // ==============================================================================
     // 4. PER-ROBOT VARIANT-SPECIFIC PARAMETERS
     // ==============================================================================
+
+#if ROBOT_ID == 2
+    constexpr uint16_t ANTENNA_DELAY_VAL = 24626; // Calibrated from 2m square test (0x6032)
+#elif ROBOT_ID == 3
+    constexpr uint16_t ANTENNA_DELAY_VAL = 24689; // Calibrated from 2m square test (0x6071)
+#elif ROBOT_ID == 4
+    constexpr uint16_t ANTENNA_DELAY_VAL = 24786; // Calibrated from 2m square test (0x60D2)
+#endif
+
+
 #if ROBOT_ID == 1
     constexpr uint8_t ID                     = 1;
     constexpr float   TRACK_WIDTH_NOM_M      = 0.1350f;
