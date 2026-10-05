@@ -45,7 +45,6 @@
 #pragma once
 
 #include <stdlib.h>
-#include <string.h>
 #include <Arduino.h>
 #include <SPI.h>
 #include "DW1000NgConstants.hpp"
@@ -226,8 +225,9 @@ namespace DW1000Ng {
 
 	@param [in] futureTimeBytes the timestamp in bytes of the time of the transmission (in UWB time)
 	*/
-	void setDelayedTRX(byte futureTimeBytes[]);
 
+	void setDelayedTRX(byte futureTimeBytes[]);
+	void setDelayedTRX(uint64_t futureTime);
 	/**
 	Sets the transmission bytes inside the tx buffer of the DW1000
 

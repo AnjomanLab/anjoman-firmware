@@ -61,14 +61,11 @@ namespace SPIporting {
 
 void readFromSPI(uint8_t slaveSelectPIN, uint8_t headerLen, byte header[], uint16_t dataLen, byte data[]) {
         _openSPI(slaveSelectPIN);
-        byte prev = 0;
         for(auto i = 0; i < headerLen; ++i) {
-            prev = _spi->transfer(header[i]);
+            _spi->transfer(header[i]);
         }
         for(auto i = 0; i < dataLen; ++i) {
-            byte curr = _spi->transfer(0x00);
-            data[i] = static_cast<byte>((prev << 7) | (curr >> 1));
-            prev = curr;
+            data[i] = _spi->transfer(0x00);
         }
         delayMicroseconds(1);
         _closeSPI(slaveSelectPIN);

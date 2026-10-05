@@ -1706,8 +1706,18 @@ void getTemperatureAndBatteryVoltage(float& temp, float& vbat) {
     _readBytesFromRegister(TX_CAL, SAR_LTEMP_SUB, &sar_ltemp, 1);
     SPIporting::setSPIspeed(SPIClock::FAST);
 
-    vbat = (static_cast<float>(sar_lvbat) - static_cast<float>(_vmeas3v3)) / 173.0f + 3.3f;
-    temp = (static_cast<float>(sar_ltemp) - static_cast<float>(_tmeas23C)) * 1.14f + 23.0f;
+    // If ADC values are left-shifted by hardware interface, normalize to 7-bit SAR range
+    if (sar_ltemp > 0x80 && _tmeas23C > 0x80) {
+        temp = (static_cast<float>(sar_ltemp >> 1) - static_cast<float>(_tmeas23C >> 1)) * 1.14f + 23.0f;
+    } else {
+        temp = (static_cast<float>(sar_ltemp) - static_cast<float>(_tmeas23C)) * 1.14f + 23.0f;
+    }
+
+    if (sar_lvbat > 0x80 && _vmeas3v3 > 0x80) {
+        vbat = (static_cast<float>(sar_lvbat >> 1) - static_cast<float>(_vmeas3v3 >> 1)) / 173.0f + 3.3f;
+    } else {
+        vbat = (static_cast<float>(sar_lvbat) - static_cast<float>(_vmeas3v3)) / 173.0f + 3.3f;
+    }
 }
 
 	void enableFrameFiltering(frame_filtering_configuration_t config) {
@@ -1953,10 +1963,18 @@ void getTemperatureAndBatteryVoltage(float& temp, float& vbat) {
         _writeBytesToRegister(DIG_DIAG, DIAG_TMC_SUB, diagnosticBytes, LEN_DIAG_TMC);
     }
 
-	void setDelayedTRX(byte futureTimeBytes[]) {
-		/* the least significant 9-bits are ignored in DX_TIME in functional modes */
-		_writeBytesToRegister(DX_TIME, NO_SUB, futureTimeBytes, LEN_DX_TIME);
-	}
+void setDelayedTRX(byte futureTimeBytes[]) {
+    _writeBytesToRegister(DX_TIME, NO_SUB, futureTimeBytes, LEN_DX_TIME);
+}
+
+void setDelayedTRX(uint64_t futureTime) {
+    byte futureTimeBytes[5];
+    futureTime &= 0xFFFFFFFFFFULL;
+    for (int i = 0; i < 5; ++i) {
+        futureTimeBytes[i] = static_cast<byte>((futureTime >> (i * 8)) & 0xFF);
+    }
+    _writeBytesToRegister(DX_TIME, NO_SUB, futureTimeBytes, LEN_DX_TIME);
+}
 
 	void setTransmitData(byte data[], uint16_t n) {
 		if(_frameCheck) {
