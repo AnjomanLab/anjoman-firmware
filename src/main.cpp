@@ -15,6 +15,18 @@
 #include "DW1000NgConstants.hpp"
 #include "DW1000NgRegisters.hpp"
 
+
+// Calibrated antenna delays (from 2 m square test)
+#if   ROBOT_ID == 2
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24626;
+#elif ROBOT_ID == 3
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24689;
+#elif ROBOT_ID == 4
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24786;
+#else
+static constexpr uint16_t ANTENNA_DELAY_VAL = 16436;  // fallback
+#endif
+
 // ==============================================================================
 // 1. Constants
 // ==============================================================================
@@ -172,7 +184,7 @@ void setupUWB() {
     DW1000Ng::applyConfiguration(UWB_CONFIG);
     DW1000Ng::setDeviceAddress(Config::ID);
     DW1000Ng::setNetworkId(0xDECA);
-    DW1000Ng::setAntennaDelay(ANTENNA_DELAY_VAL);
+    DW1000Ng::setAntennaDelay(16436);
     DW1000Ng::forceTRxOff();
 
     // DEV_ID diagnostic - THIS IS THE KEY TEST

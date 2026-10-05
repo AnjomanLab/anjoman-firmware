@@ -226,6 +226,17 @@ namespace Config {
     constexpr float   Q_GYRO_BIAS_WALK       = 1.00e-12f;
     constexpr float   R_YAW_ENCODER          = 1.68e-6f;
 
+
+    // Calibrated antenna delays (from 2 m square test)
+#if   ROBOT_ID == 2
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24626;
+#elif ROBOT_ID == 3
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24689;
+#elif ROBOT_ID == 4
+static constexpr uint16_t ANTENNA_DELAY_VAL = 24786;
+#else
+static constexpr uint16_t ANTENNA_DELAY_VAL = 16436;  // fallback
+#endif
     // ------------------------------------------------------------------
     // ESKF (local error-state Kalman filter, 4-state)
     // ------------------------------------------------------------------
