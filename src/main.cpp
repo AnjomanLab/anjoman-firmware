@@ -1,671 +1,270 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <esp_now.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <esp_wifi.h>
 
-#include <DW1000Ng.hpp>
-#include <DW1000NgUtils.hpp>
-
 #include "PinMap.h"
-#include "RobotConfig.h"
-#include "Types.h"
-#include "AnjomanI2C.h"
-#include "MagneticEncoder.h"
-#include "MotorController.h"
-#include "BMI160_Custom.h"
-#include "INA226.h"
-#include "ESKF.h"
-#include "UWBPreprocessor.h"
-#include "FormationReference.h"
-#include "FormationController.h"
-#include "TDMAEngine.h"
 
-constexpr double SPEED_OF_LIGHT = 299792458.0;
-constexpr double TIME_UNIT_SEC  = 0.000000000015650040064103;
-constexpr uint64_t SCHEDULED_REPLY_DELAY = 159744000ULL;
+#include "dw1000_osal.h"
+#include "dw1000_core.h"
+#include "dw1000_regs.h"
+#include "dw1000_tuning.h"
+#include "ss_twr.h"
+#include "tdma_scheduler.h"
 
-uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+#define DW1000_PIN_CS       PIN_UWB_CS
+#define DW1000_PIN_IRQ      PIN_UWB_IRQ
+#define DW1000_PIN_RST      -1
+#define DW1000_PIN_WAKEUP   PIN_UWB_WAKEUP
 
-device_configuration_t UWB_CONFIG = {
-    false, true, true, true, false,
-    SFDMode::STANDARD_SFD,
-    Channel::CHANNEL_5,
-    DataRate::RATE_850KBPS,
-    PulseFrequency::FREQ_16MHZ,
-    PreambleLength::LEN_256,
-    PreambleCode::CODE_3
+#define GATEWAY_MAC_0       0xFF
+#define GATEWAY_MAC_1       0xFF
+#define GATEWAY_MAC_2       0xFF
+#define GATEWAY_MAC_3       0xFF
+#define GATEWAY_MAC_4       0xFF
+#define GATEWAY_MAC_5       0xFF
+
+#define TELEMETRY_INTERVAL_MS   500
+#define SERIAL_BAUD             460800
+
+extern const dw1000_spi_ops_t   esp32_spi_ops;
+extern const dw1000_gpio_ops_t  esp32_gpio_ops;
+extern const dw1000_delay_ops_t esp32_delay_ops;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  robot_id;
+    uint8_t  n_peers;
+    uint8_t  n_ranging_ok;
+    uint8_t  n_ranging_fail;
+    uint16_t dist_r2_cm;
+    uint16_t dist_r3_cm;
+    uint16_t dist_r4_cm;
+    uint8_t  temperature_c;
+    uint16_t voltage_mv;
+    uint32_t sync_error_us;
+    uint32_t frame_counter;
+    uint32_t uptime_ms;
+} telemetry_packet_t;
+
+static dw1000_port_ops_t   g_port_runtime;
+static telemetry_packet_t  g_telemetry;
+static uint8_t g_gateway_mac[6] = {
+    GATEWAY_MAC_0, GATEWAY_MAC_1, GATEWAY_MAC_2,
+    GATEWAY_MAC_3, GATEWAY_MAC_4, GATEWAY_MAC_5
 };
+static uint32_t g_last_telemetry_ms = 0;
+static uint32_t g_frame_counter = 0;
 
-constexpr uint8_t ACTIVE_ROBOTS[] = {2, 3, 4};
-constexpr uint8_t N_ACTIVE        = 3;
+static void build_port_ops(void) {
+    g_port_runtime.spi   = esp32_spi_ops;
+    g_port_runtime.gpio  = esp32_gpio_ops;
+    g_port_runtime.delay = esp32_delay_ops;
+}
 
-static bool isActive(uint8_t id) {
-    for (uint8_t i = 0; i < N_ACTIVE; i++) {
-        if (ACTIVE_ROBOTS[i] == id) return true;
+static int get_robot_index(uint8_t robot_id) {
+    if (robot_id == 2) return 0;
+    if (robot_id == 3) return 1;
+    if (robot_id == 4) return 2;
+    return 0;
+}
+
+static void print_banner(void) {
+    Serial.println();
+    Serial.println("============================================");
+    Serial.printf("  ANJOMAN UWB v2 - ROBOT R%d\n", ROBOT_ID);
+    Serial.println("============================================");
+    Serial.printf("  Build:    %s %s\n", __DATE__, __TIME__);
+    Serial.printf("  CS pin:   %d\n", DW1000_PIN_CS);
+    Serial.printf("  IRQ pin:  %d\n", DW1000_PIN_IRQ);
+    Serial.printf("  RST pin:  %d\n", DW1000_PIN_RST);
+    Serial.printf("  WAKEUP:   %d\n", DW1000_PIN_WAKEUP);
+    Serial.println("============================================");
+    Serial.println();
+}
+
+static int init_dw1000(void) {
+    build_port_ops();
+    dw1000_port_init(&g_port_runtime);
+
+    dw1000_port_set_pins(DW1000_PIN_CS, DW1000_PIN_IRQ,
+                         DW1000_PIN_RST, DW1000_PIN_WAKEUP);
+
+    dw1000_config_t cfg;
+    cfg.channel       = DW1000_CHANNEL_5;
+    cfg.prf           = DW1000_PRF_16MHZ;
+    cfg.preamble_len  = DW1000_PREAMBLE_256;
+    cfg.datarate      = DW1000_DATARATE_850K;
+    cfg.pac_size      = DW1000_PAC_8;
+    cfg.xtal_trim     = DW1000_XTAL_TRIM_OTP_DEFAULT;
+    cfg.spi_speed_hz  = DW1000_SPI_SPEED_HZ;
+
+    int idx = get_robot_index(ROBOT_ID);
+    cfg.tx_antd = dw1000_get_tx_antd(idx);
+    cfg.rx_antd = dw1000_get_rx_antd(idx);
+
+    Serial.println("[DW1000] Initializing...");
+    Serial.printf("[DW1000] Channel:    %d\n", cfg.channel);
+    Serial.printf("[DW1000] PRF:        %d MHz\n", cfg.prf == DW1000_PRF_16MHZ ? 16 : 64);
+    Serial.printf("[DW1000] Preamble:   %d\n", cfg.preamble_len == DW1000_PREAMBLE_256 ? 256 : 128);
+    Serial.printf("[DW1000] TX_ANTD:    %u\n", cfg.tx_antd);
+    Serial.printf("[DW1000] RX_ANTD:    %u\n", cfg.rx_antd);
+    Serial.printf("[DW1000] XTAL_TRIM:  0x%02X\n", cfg.xtal_trim);
+    Serial.printf("[DW1000] SPI Mode:   %d\n", DW1000_SPI_MODE_0);
+    pinMode(13, INPUT);
+delay(10);
+Serial.printf("[DEBUG] GPIO 13 (MISO) idle state: %d\n", digitalRead(13));
+
+    int ret = dw1000_init(&cfg);
+    if (ret != DW1000_OK) {
+        Serial.printf("[DW1000] Init FAILED: %d\n", ret);
+        return ret;
     }
-    return false;
-}
 
-static uint8_t allPeersMaskForMe() {
-    uint8_t mask = 0;
-    for (uint8_t i = 0; i < N_ACTIVE; i++) {
-        if (ACTIVE_ROBOTS[i] != Config::ID) {
-            mask |= (1u << ACTIVE_ROBOTS[i]);
-        }
+    uint32_t dev_id = dw1000_get_device_id();
+    Serial.printf("[DW1000] DEV_ID:     0x%08X (expected 0x%08X)\n",
+                  dev_id, DW1000_DEV_ID_VAL);
+
+    if (dev_id != DW1000_DEV_ID_VAL) {
+        Serial.println("[DW1000] DEV_ID mismatch!");
+        return DW1000_ERR_NO_DEVICE;
     }
-    return mask;
+
+    Serial.println("[DW1000] Init OK");
+    return DW1000_OK;
 }
 
-MotorController motorL(PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, Config::INVERT_MOTOR_LEFT);
-MotorController motorR(PIN_MOTOR_R_IN1, PIN_MOTOR_R_IN2, Config::INVERT_MOTOR_RIGHT);
-
-MagneticEncoder encL(Wire, 0x70, 0, Config::INVERT_ENCODER_LEFT);
-MagneticEncoder encR(Wire, 0x70, 1, Config::INVERT_ENCODER_RIGHT);
-
-BMI160_Custom   imu(Wire, 0x69, 2);
-INA226          power_monitor(Wire, 0x40, 3, Config::SHUNT_RESISTOR_OHM);
-
-ESKF            g_eskf;
-TDMAEngine      tdma;
-
-struct SlotAction {
-    uint8_t actor;
-    uint8_t target;
-    bool    isBeacon;
-};
-
-static const SlotAction SLOT_TABLE[16] = {
-    {2, 0, true},  {2, 3, false}, {2, 4, false}, {0, 0, false},
-    {3, 0, true},  {3, 2, false}, {3, 4, false}, {0, 0, false},
-    {4, 0, true},  {4, 2, false}, {4, 3, false}, {0, 0, false},
-    {0, 0, false}, {0, 0, false}, {0, 0, false}, {0, 0, false},
-};
-
-struct SharedState {
-    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-
-    float posX, posY, headingRad;
-    float vCommand, omegaCommand;
-    float rpmL, rpmR;
-    float gyroZ;
-    float imuTempC;
-    float accelX;
-
-    float eskfVarX, eskfVarY, eskfVarTheta, eskfVarBias;
-
-    float dutyL, dutyR;
-    float targetRpmL, targetRpmR;
-
-    bool     maneuverRunning;
-    bool     maneuverFinished;
-    uint32_t maneuverStartMs;
-    uint8_t  robotState;
-} g_shared;
-
-struct UWBMetrics {
-    bool     valid;
-    uint8_t  peerId;
-    uint8_t  ldeErr;
-    uint16_t stdNoise;
-    uint16_t fpAmpl1;
-    uint16_t fpAmpl2;
-    uint16_t cirPwr;
-    uint16_t rxpacc;
-    float    rawDist;
-    float    cleanDist;
-    float    rssi;
-    float    fpPower;
-    float    respTemp;
-    float    cfoPpm;
-};
-UWBMetrics g_uwbMetrics[5];
-
-static float    g_chipTempUwb = 25.0f;
-static float    g_chipVbatUwb = 3.3f;
-static uint32_t g_lastUwbMonitorMs = 0;
-
-static uint8_t  g_peersSeenMask       = 0;
-static uint32_t g_candidateStartFrame = 0;
-static bool     g_maneuverTriggered   = false;
-
-inline void write40BitTime(uint8_t *dest, uint64_t val) {
-    dest[0] = static_cast<uint8_t>(val & 0xFF);
-    dest[1] = static_cast<uint8_t>((val >> 8) & 0xFF);
-    dest[2] = static_cast<uint8_t>((val >> 16) & 0xFF);
-    dest[3] = static_cast<uint8_t>((val >> 24) & 0xFF);
-    dest[4] = static_cast<uint8_t>((val >> 32) & 0xFF);
+static void esp_now_recv_cb(const uint8_t *mac, const uint8_t *data, int len) {
+    (void)mac;
+    (void)data;
+    (void)len;
 }
 
-inline uint64_t read40BitTime(const uint8_t *src) {
-    return (static_cast<uint64_t>(src[0]))        |
-           (static_cast<uint64_t>(src[1]) << 8)   |
-           (static_cast<uint64_t>(src[2]) << 16)  |
-           (static_cast<uint64_t>(src[3]) << 24)  |
-           (static_cast<uint64_t>(src[4]) << 32);
+static void esp_now_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
+    (void)mac;
+    (void)status;
 }
 
-void Core1_ControlTask(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(Config::CONTROL_PERIOD_MS);
-
-    float initRx, initRy;
-    FormationReference::getUnitOffset(Config::ID, initRx, initRy);
-    float odomX = FormationReference::L_INITIAL * initRx;
-    float odomY = FormationReference::L_INITIAL * initRy;
-
-    g_eskf.init(odomX, odomY, 0.0f, Config::GYRO_BIAS_Z_RAD_S);
-
-    constexpr float RAD_S_TO_RPM = 60.0f / (2.0f * 3.1415926535f);
-
-    while (true) {
-        const float dt = Config::CONTROL_PERIOD_S;
-
-        encL.update(dt);
-        encR.update(dt);
-        imu.readSensorData();
-
-        const float measRpmL = encL.getRPM();
-        const float measRpmR = encR.getRPM();
-        const float measRadL = encL.getRadPerSec();
-        const float measRadR = encR.getRadPerSec();
-
-        const float gyroZRadS = imu.getGyroZ() * 0.01745329251f;
-
-        const float vActual = 0.5f * (measRadL + measRadR) * Config::WHEEL_RADIUS_M;
-        const float deltaThetaEnc =
-            (measRadR - measRadL) * (Config::WHEEL_RADIUS_M / Config::TRACK_WIDTH_M) * dt;
-
-        g_eskf.predict(vActual, gyroZRadS, dt,
-                       Config::Q_POS_ESKF,
-                       Config::Q_THETA_ESKF,
-                       Config::Q_BIAS_ESKF);
-        g_eskf.updateEncoder(deltaThetaEnc, gyroZRadS, dt,
-                             Config::R_THETA_ESKF);
-
-        odomX = g_eskf.getX();
-        odomY = g_eskf.getY();
-        const float odomTheta = g_eskf.getTheta();
-
-        portENTER_CRITICAL(&g_shared.mux);
-        const float targetV     = g_shared.vCommand;
-        const float targetOmega = g_shared.omegaCommand;
-        const bool  isActive_   = g_shared.maneuverRunning;
-        const bool  isFinished_ = g_shared.maneuverFinished;
-        portEXIT_CRITICAL(&g_shared.mux);
-
-        float dutyL = 0.0f, dutyR = 0.0f;
-        float targetRpmL = 0.0f, targetRpmR = 0.0f;
-
-        if (!isActive_ || isFinished_) {
-            motorL.brake();
-            motorR.brake();
-        } else {
-            const float vTargetL = targetV - 0.5f * Config::TRACK_WIDTH_M * targetOmega;
-            const float vTargetR = targetV + 0.5f * Config::TRACK_WIDTH_M * targetOmega;
-
-            targetRpmL = (vTargetL / Config::WHEEL_RADIUS_M) * RAD_S_TO_RPM;
-            targetRpmR = (vTargetR / Config::WHEEL_RADIUS_M) * RAD_S_TO_RPM;
-
-            dutyL = motorL.computeVelocityControl(targetRpmL, measRpmL, 7.4f, dt);
-            dutyR = motorR.computeVelocityControl(targetRpmR, measRpmR, 7.4f, dt);
-        }
-
-        portENTER_CRITICAL(&g_shared.mux);
-        g_shared.posX          = odomX;
-        g_shared.posY          = odomY;
-        g_shared.headingRad    = odomTheta;
-        g_shared.rpmL          = measRpmL;
-        g_shared.rpmR          = measRpmR;
-        g_shared.gyroZ         = gyroZRadS;
-        g_shared.imuTempC      = imu.getTemperature();
-        g_shared.accelX        = imu.getAccX();
-        g_shared.eskfVarX      = g_eskf.getVarX();
-        g_shared.eskfVarY      = g_eskf.getVarY();
-        g_shared.eskfVarTheta  = g_eskf.getVarTheta();
-        g_shared.eskfVarBias   = g_eskf.getVarBias();
-        g_shared.dutyL         = dutyL;
-        g_shared.dutyR         = dutyR;
-        g_shared.targetRpmL    = targetRpmL;
-        g_shared.targetRpmR    = targetRpmR;
-        portEXIT_CRITICAL(&g_shared.mux);
-
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
-}
-
-void onDataRecv(const uint8_t *mac, const uint8_t *data, int data_len) {
-    if (data_len != sizeof(SyncBeaconPacket)) return;
-
-    SyncBeaconPacket pkt;
-    memcpy(&pkt, data, sizeof(pkt));
-
-    if (pkt.senderId == Config::ID) return;
-    if (!isActive(pkt.senderId))     return;
-
-    tdma.onSyncReceived(pkt.senderId,
-                        pkt.frameId,
-                        pkt.senderUptimeMs,
-                        pkt.senderSlot,
-                        millis(),
-                        micros());
-
-    g_peersSeenMask |= (1u << pkt.senderId);
-    if (pkt.maneuverStartFrame > g_candidateStartFrame) {
-        g_candidateStartFrame = pkt.maneuverStartFrame;
-    }
-}
-
-void setupESPNow() {
+static int init_esp_now(void) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
 
-    if (esp_now_init() != ESP_OK) return;
-
-    esp_now_register_recv_cb(onDataRecv);
-
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, BROADCAST_MAC, 6);
-    peerInfo.channel = 1;
-    peerInfo.encrypt = false;
-    peerInfo.ifidx   = WIFI_IF_STA;
-    esp_now_add_peer(&peerInfo);
-}
-
-void setupUWB() {
-    pinMode(PIN_UWB_CS, OUTPUT);
-    digitalWrite(PIN_UWB_CS, HIGH);
-
-    if (PIN_UWB_RST != 0xFF) {
-        pinMode(PIN_UWB_RST, OUTPUT);
-        digitalWrite(PIN_UWB_RST, LOW);
-        delay(5);
-        pinMode(PIN_UWB_RST, INPUT);
-        delay(25);
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESP-NOW] Init FAILED");
+        return -1;
     }
 
-    SPI.begin(PIN_UWB_SCK, PIN_UWB_MISO, PIN_UWB_MOSI, -1);
-    DW1000Ng::initializeNoInterrupt(PIN_UWB_CS, PIN_UWB_RST);
-    DW1000Ng::applyConfiguration(UWB_CONFIG);
-    DW1000Ng::setDeviceAddress(Config::ID);
-    DW1000Ng::setNetworkId(0xDECA);
+    esp_now_register_recv_cb(esp_now_recv_cb);
+    esp_now_register_send_cb(esp_now_send_cb);
 
-    DW1000Ng::setAntennaDelay(Config::ANTENNA_DELAY_VAL);
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, g_gateway_mac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
 
-    DW1000Ng::clearReceiveStatus();
-    DW1000Ng::clearTransmitStatus();
-    DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
-}
-
-bool performRangingPoll(uint8_t targetPeerId) {
-    if (targetPeerId < 1 || targetPeerId > 4 || targetPeerId == Config::ID) {
-        return false;
-    }
-    if (!isActive(targetPeerId)) return false;
-
-    UWBPollPacket pollPkt = {};
-    memcpy(pollPkt.header, "POLL", 4);
-    pollPkt.initiatorId = Config::ID;
-    pollPkt.targetId    = targetPeerId;
-    pollPkt.sequence    = tdma.getFrameId();
-
-    DW1000Ng::forceTRxOff();
-    DW1000Ng::clearTransmitStatus();
-    DW1000Ng::clearReceiveStatus();
-    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&pollPkt), sizeof(pollPkt));
-    
-    // Guard delay to ensure listener is fully in RX state before RF packet launch
-    delayMicroseconds(2000);
-    DW1000Ng::startTransmit(TransmitMode::IMMEDIATE);
-
-    const uint32_t txStart = millis();
-    while (!DW1000Ng::isTransmitDone()) {
-        if (millis() - txStart > 6) return false;
-        yield();
-    }
-    DW1000Ng::clearTransmitStatus();
-    const uint64_t tTx1 = DW1000Ng::getTransmitTimestamp();
-
-    DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
-    const uint32_t waitRx = millis();
-    bool success = false;
-
-    while (millis() - waitRx < 10) {
-        if (DW1000Ng::isReceiveDone()) {
-            DW1000Ng::clearReceiveStatus();
-            const size_t len = DW1000Ng::getReceivedDataLength();
-
-            if (len >= sizeof(UWBResponsePacket)) {
-                UWBResponsePacket respPkt;
-                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&respPkt), sizeof(respPkt));
-
-                if (memcmp(respPkt.header, "RESP", 4) == 0 &&
-                    respPkt.responderId == targetPeerId &&
-                    respPkt.targetId    == Config::ID) {
-
-                    const uint64_t tRx1 = DW1000Ng::getReceiveTimestamp();
-                    const uint64_t tRx2 = read40BitTime(respPkt.rxTimestamp);
-                    const uint64_t tTx2 = read40BitTime(respPkt.txTimestamp);
-
-                    const int64_t tRound = static_cast<int64_t>((tRx1 - tTx1) & 0xFFFFFFFFFFULL);
-                    const int64_t tReply = static_cast<int64_t>((tTx2 - tRx2) & 0xFFFFFFFFFFULL);
-
-                    if (tReply < tRound) {
-                        float cfoRatio = DW1000Ng::getClockOffsetRatio();
-                        if (cfoRatio > 0.0001f)  cfoRatio = 0.0001f;
-                        if (cfoRatio < -0.0001f) cfoRatio = -0.0001f;
-
-                        const double tReplyCorr = static_cast<double>(tReply) * (1.0 - static_cast<double>(cfoRatio));
-                        const int64_t tofTicks = static_cast<int64_t>((static_cast<double>(tRound) - tReplyCorr) / 2.0);
-
-                        const float distRawM = static_cast<float>(tofTicks * TIME_UNIT_SEC * SPEED_OF_LIGHT);
-                        const float cleanM = UWBPreprocessor::correctRawDistance(
-                            Config::ID, targetPeerId, distRawM, 0.0f, 0.0f);
-
-                        const auto diag = DW1000Ng::getChannelDiagnostics();
-
-                        UWBMetrics &m = g_uwbMetrics[targetPeerId];
-                        m.valid      = true;
-                        m.peerId     = targetPeerId;
-                        m.ldeErr     = diag.ldeError;
-                        m.stdNoise   = diag.stdNoise;
-                        m.fpAmpl1    = diag.fpAmpl1;
-                        m.fpAmpl2    = diag.fpAmpl2;
-                        m.cirPwr     = diag.cirPwr;
-                        m.rxpacc     = diag.rxpacc;
-                        m.rawDist    = distRawM;
-                        m.cleanDist  = cleanM;
-                        m.rssi       = static_cast<float>(DW1000Ng::getReceivePower());
-                        m.fpPower    = static_cast<float>(DW1000Ng::getFirstPathPower());
-                        m.respTemp   = respPkt.tempUwb;
-
-                        success = true;
-                    }
-                }
-            }
-            break;
+    if (!esp_now_is_peer_exist(g_gateway_mac)) {
+        if (esp_now_add_peer(&peer) != ESP_OK) {
+            Serial.println("[ESP-NOW] Add peer FAILED");
+            return -1;
         }
-        yield();
     }
-    DW1000Ng::forceTRxOff();
-    return success;
+
+    uint8_t local_mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, local_mac);
+    Serial.printf("[ESP-NOW] Local MAC:   %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  local_mac[0], local_mac[1], local_mac[2],
+                  local_mac[3], local_mac[4], local_mac[5]);
+    Serial.printf("[ESP-NOW] Gateway MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  g_gateway_mac[0], g_gateway_mac[1], g_gateway_mac[2],
+                  g_gateway_mac[3], g_gateway_mac[4], g_gateway_mac[5]);
+
+    return 0;
 }
 
-bool performRangingListenBlocking(uint32_t timeoutMs) {
-    DW1000Ng::forceTRxOff();
-    DW1000Ng::clearReceiveStatus();
-    DW1000Ng::clearTransmitStatus();
-    DW1000Ng::startReceive(ReceiveMode::IMMEDIATE);
+static void send_telemetry(void) {
+    g_telemetry.robot_id       = ROBOT_ID;
+    g_telemetry.n_peers        = (uint8_t)tdma_scheduler_get_n_peers();
+    g_telemetry.n_ranging_ok   = (uint8_t)tdma_scheduler_get_n_ranging_ok();
+    g_telemetry.n_ranging_fail = (uint8_t)tdma_scheduler_get_n_ranging_fail();
+    g_telemetry.dist_r2_cm     = (uint16_t)tdma_scheduler_get_peer_distance(2);
+    g_telemetry.dist_r3_cm     = (uint16_t)tdma_scheduler_get_peer_distance(3);
+    g_telemetry.dist_r4_cm     = (uint16_t)tdma_scheduler_get_peer_distance(4);
+    g_telemetry.temperature_c  = dw1000_read_temperature();
+    g_telemetry.voltage_mv     = dw1000_read_voltage();
+    g_telemetry.sync_error_us  = tdma_scheduler_get_sync_error_us();
+    g_telemetry.frame_counter  = g_frame_counter;
+    g_telemetry.uptime_ms      = millis();
 
-    const uint32_t t_start = millis();
-    bool success = false;
-
-    while (millis() - t_start < timeoutMs) {
-        if (DW1000Ng::isReceiveDone()) {
-            DW1000Ng::clearReceiveStatus();
-            const size_t len = DW1000Ng::getReceivedDataLength();
-
-            if (len >= sizeof(UWBPollPacket)) {
-                UWBPollPacket pollPkt;
-                DW1000Ng::getReceivedData(reinterpret_cast<byte*>(&pollPkt),
-                                          sizeof(pollPkt));
-
-                if (memcmp(pollPkt.header, "POLL", 4) == 0 &&
-                    pollPkt.targetId == Config::ID) {
-
-                    const uint64_t tRx2 = DW1000Ng::getReceiveTimestamp();
-                    const uint64_t tTx2 = (tRx2 + SCHEDULED_REPLY_DELAY) & 0xFFFFFFFE00ULL;
-
-                    UWBResponsePacket respPkt = {};
-                    memcpy(respPkt.header, "RESP", 4);
-                    respPkt.responderId = Config::ID;
-                    respPkt.targetId    = pollPkt.initiatorId;
-                    respPkt.sequence    = pollPkt.sequence;
-                    write40BitTime(respPkt.rxTimestamp, tRx2);
-                    write40BitTime(respPkt.txTimestamp, tTx2);
-                    respPkt.tempUwb     = g_chipTempUwb;
-                    respPkt.tempEsp     = 25.0f;
-                    respPkt.vbatUwb     = g_chipVbatUwb;
-
-                    DW1000Ng::forceTRxOff();
-                    DW1000Ng::clearTransmitStatus();
-                    DW1000Ng::setTransmitData(reinterpret_cast<byte*>(&respPkt),
-                                              sizeof(respPkt));
-                    DW1000Ng::setDelayedTRX(respPkt.txTimestamp);
-                    DW1000Ng::startTransmit(TransmitMode::DELAYED);
-
-                    const uint32_t txWait = millis();
-                    while (!DW1000Ng::isTransmitDone()) {
-                        if (millis() - txWait > 6) break;
-                        yield();
-                    }
-                    DW1000Ng::clearTransmitStatus();
-                    success = true;
-                    break;
-                }
-            }
-        }
-
-        if (DW1000Ng::isReceiveFailed() || DW1000Ng::isReceiveTimeout()) {
-            DW1000Ng::clearReceiveStatus();
-        }
-
-        yield();
-    }
-
-    DW1000Ng::forceTRxOff();
-    return success;
+    esp_now_send(g_gateway_mac, (uint8_t *)&g_telemetry, sizeof(g_telemetry));
 }
 
-static void sendBeacon(uint8_t slot) {
-    SyncBeaconPacket pkt = {};
-    pkt.senderId           = Config::ID;
-    pkt.senderSlot         = slot;
-    pkt.frameId            = tdma.getFrameId();
-    pkt.senderUptimeMs     = millis();
-    pkt.maneuverStartFrame = g_candidateStartFrame;
+static void print_status(void) {
+    Serial.println("--------------------------------------------");
+    Serial.printf("[R%d] frame=%lu  n_peers=%lu  ok=%lu  fail=%lu\n",
+                  ROBOT_ID,
+                  (unsigned long)g_frame_counter,
+                  (unsigned long)tdma_scheduler_get_n_peers(),
+                  (unsigned long)tdma_scheduler_get_n_ranging_ok(),
+                  (unsigned long)tdma_scheduler_get_n_ranging_fail());
 
-    portENTER_CRITICAL(&g_shared.mux);
-    pkt.posX               = g_shared.posX;
-    pkt.posY               = g_shared.posY;
-    pkt.headingRad         = g_shared.headingRad;
-    portEXIT_CRITICAL(&g_shared.mux);
+    Serial.printf("     D(2)=%u cm  D(3)=%u cm  D(4)=%u cm\n",
+                  tdma_scheduler_get_peer_distance(2),
+                  tdma_scheduler_get_peer_distance(3),
+                  tdma_scheduler_get_peer_distance(4));
 
-    pkt.senderTempUwb      = g_chipTempUwb;
+    Serial.printf("     Temp=%u C  Volt=%u mV  SyncErr=%lu us\n",
+                  dw1000_read_temperature(),
+                  dw1000_read_voltage(),
+                  (unsigned long)tdma_scheduler_get_sync_error_us());
 
-    uint8_t idx = 0;
-    for (uint8_t i = 0; i < N_ACTIVE && idx < 2; i++) {
-        const uint8_t p = ACTIVE_ROBOTS[i];
-        if (p == Config::ID) continue;
-
-        const UWBMetrics &m = g_uwbMetrics[p];
-        if (!m.valid) continue;
-
-        UWBBeaconEntry &e = pkt.peers[idx];
-        e.peerId    = p;
-        e.ldeErr    = m.ldeErr;
-        e.rawDist   = m.rawDist;
-        e.cleanDist = m.cleanDist;
-        e.rssi      = m.rssi;
-        e.fpPower   = m.fpPower;
-        e.respTemp  = m.respTemp;
-        e.cfoPpm    = m.cfoPpm;
-        idx++;
+    Serial.print("     Slot roles: ");
+    for (uint8_t i = 0; i < TDMA_FRAME_SLOTS; i++) {
+        Serial.printf("%d", (int)tdma_scheduler_get_role(i));
     }
-    pkt.nPeers = idx;
-
-    static float    lastVbat   = 7.4f;
-    static uint32_t lastVbatMs = 0;
-    if (millis() - lastVbatMs >= 1000) {
-        lastVbatMs = millis();
-        float v, i, pwr;
-        if (power_monitor.read(v, i, pwr)) lastVbat = v;
-    }
-    pkt.vbat = lastVbat;
-
-    esp_now_send(BROADCAST_MAC, reinterpret_cast<uint8_t*>(&pkt), sizeof(pkt));
-}
-
-static void handleSlot(uint32_t slot) {
-    if (slot >= 16) return;
-    const SlotAction &a = SLOT_TABLE[slot];
-
-    if (!isActive(a.actor)) return;
-
-    if (a.isBeacon) {
-        if (a.actor == Config::ID) {
-            sendBeacon(static_cast<uint8_t>(slot));
-        }
-        return;
-    }
-
-    if (a.actor == Config::ID) {
-        performRangingPoll(a.target);
-    } else if (a.target == Config::ID) {
-        performRangingListenBlocking(13);
-    }
+    Serial.println();
+    Serial.println("--------------------------------------------");
 }
 
 void setup() {
-    Serial.begin(460800);
-    delay(1000);
+    Serial.begin(SERIAL_BAUD);
+    delay(500);
 
-    AnjomanI2C::init(PIN_I2C0_SDA, PIN_I2C0_SCL, 400000);
+    print_banner();
 
-    motorL.begin(20000, 10);
-    motorR.begin(20000, 10);
+    if (init_dw1000() != DW1000_OK) {
+        Serial.println("[FATAL] DW1000 init failed - halting");
+        while (1) { delay(1000); }
+    }
 
-    MotorSysIDParams paramsL = {
-        Config::DEADBAND_FWD_L, Config::DEADBAND_REV_L,
-        Config::GAIN_RPM_FWD_L, Config::GAIN_RPM_REV_L,
-        7.40f
-    };
-    MotorSysIDParams paramsR = {
-        Config::DEADBAND_FWD_R, Config::DEADBAND_REV_R,
-        Config::GAIN_RPM_FWD_R, Config::GAIN_RPM_REV_R,
-        7.40f
-    };
-    motorL.setCalibration(paramsL);
-    motorR.setCalibration(paramsR);
+    if (tdma_scheduler_init(ROBOT_ID) != TDMA_OK) {
+        Serial.println("[FATAL] TDMA init failed - halting");
+        while (1) { delay(1000); }
+    }
+    Serial.printf("[TDMA] Initialized for R%d\n", ROBOT_ID);
+    Serial.printf("[TDMA] Slot duration:  %lu us\n",
+                  (unsigned long)tdma_scheduler_slot_duration_us());
+    Serial.printf("[TDMA] Frame duration: %lu us\n",
+                  (unsigned long)tdma_scheduler_frame_duration_us());
+    Serial.printf("[TDMA] Guard time:     %d us\n", TDMA_GUARD_US);
+    Serial.printf("[TDMA] TX offset:      %d us\n", TDMA_TX_OFFSET_US);
 
-    PIDGains gains = { 0.0050f, 0.035f, 0.40f };
-    motorL.setPIDGains(gains);
-    motorR.setPIDGains(gains);
+    if (init_esp_now() != 0) {
+        Serial.println("[WARN] ESP-NOW init failed - telemetry disabled");
+    }
 
-    encL.begin();
-    encR.begin();
-    imu.begin();
-    power_monitor.begin();
-
-    setupESPNow();
-    setupUWB();
-
-    tdma.init(Config::ID);
-
-    for (int i = 0; i < 5; i++) g_uwbMetrics[i] = UWBMetrics{};
-
-    neopixelWrite(PIN_STATUS_RGB, 50, 40, 0);
-
-    xTaskCreatePinnedToCore(
-        Core1_ControlTask,
-        "Core1_Control",
-        8192,
-        NULL,
-        3,
-        NULL,
-        1
-    );
+    Serial.println();
+    Serial.println("[READY] Starting TDMA loop...");
+    Serial.println();
 }
 
 void loop() {
-    const uint32_t nowMs = millis();
-    tdma.tick(nowMs, micros());
+    tdma_scheduler_run_frame();
+    g_frame_counter++;
 
-    if (nowMs - g_lastUwbMonitorMs >= 1000) {
-        g_lastUwbMonitorMs = nowMs;
-        float t = 0.0f, v = 0.0f;
-        DW1000Ng::getTemperatureAndBatteryVoltage(t, v);
-        if (t > 0.0f && t < 100.0f) g_chipTempUwb = t;
-        if (v > 2.0f && v < 4.5f)   g_chipVbatUwb = v;
+    uint32_t now = millis();
+    if (now - g_last_telemetry_ms >= TELEMETRY_INTERVAL_MS) {
+        g_last_telemetry_ms = now;
+        send_telemetry();
+        print_status();
     }
-
-    if (g_candidateStartFrame == 0) {
-        const uint8_t requiredPeers = allPeersMaskForMe();
-        if ((g_peersSeenMask & requiredPeers) == requiredPeers) {
-            g_candidateStartFrame = tdma.getFrameId() + 100;
-        }
-    }
-
-    if (!g_maneuverTriggered &&
-        g_candidateStartFrame > 0 &&
-        tdma.getFrameId() >= g_candidateStartFrame) {
-
-        g_maneuverTriggered = true;
-
-        portENTER_CRITICAL(&g_shared.mux);
-        g_shared.maneuverRunning = true;
-        g_shared.maneuverStartMs = nowMs;
-        g_shared.robotState      = 1;
-        portEXIT_CRITICAL(&g_shared.mux);
-    }
-
-    static uint32_t lastCtrlMs = 0;
-    if (nowMs - lastCtrlMs >= 100) {
-        lastCtrlMs = nowMs;
-
-        portENTER_CRITICAL(&g_shared.mux);
-        const bool     isRunning = g_shared.maneuverRunning;
-        const bool     isDone    = g_shared.maneuverFinished;
-        const uint32_t startMs   = g_shared.maneuverStartMs;
-        const float    curX      = g_shared.posX;
-        const float    curY      = g_shared.posY;
-        const float    curTh     = g_shared.headingRad;
-        portEXIT_CRITICAL(&g_shared.mux);
-
-        if (isRunning && !isDone && nowMs >= startMs) {
-            const float tElapsedSec = static_cast<float>(nowMs - startMs) / 1000.0f;
-
-            neopixelWrite(PIN_STATUS_RGB, 0, 50, 0);
-
-            if (tElapsedSec >= FormationReference::T_TOTAL_SEC) {
-                portENTER_CRITICAL(&g_shared.mux);
-                g_shared.maneuverFinished = true;
-                g_shared.vCommand         = 0.0f;
-                g_shared.omegaCommand     = 0.0f;
-                g_shared.robotState       = 2;
-                portEXIT_CRITICAL(&g_shared.mux);
-
-                neopixelWrite(PIN_STATUS_RGB, 0, 0, 50);
-            } else {
-                const FormationState2D target =
-                    FormationReference::evaluate(Config::ID, tElapsedSec);
-
-                const WheelVelocityCommand cmd =
-                    FormationController::compute(Config::ID, target,
-                                                 curX, curY, curTh);
-
-                portENTER_CRITICAL(&g_shared.mux);
-                g_shared.vCommand     = cmd.vLinear;
-                g_shared.omegaCommand = cmd.omegaRadS;
-                portEXIT_CRITICAL(&g_shared.mux);
-            }
-        }
-    }
-
-    const uint32_t frame = tdma.getFrameId();
-    const uint32_t slot  = tdma.getCurrentSlotIndex();
-
-    static uint32_t lastActedFrame = UINT32_MAX;
-    static uint32_t lastActedSlot  = UINT32_MAX;
-
-    if (frame != lastActedFrame || slot != lastActedSlot) {
-        lastActedFrame = frame;
-        lastActedSlot  = slot;
-        handleSlot(slot);
-    }
-
-    yield();
 }

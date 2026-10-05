@@ -34,8 +34,9 @@ constexpr uint8_t PIN_UWB_SCK        = 12;
 constexpr uint8_t PIN_UWB_MISO       = 13;
 constexpr uint8_t PIN_UWB_CS         = 14;
 
-constexpr uint8_t PIN_UWB_RST        = 10;
+constexpr uint8_t PIN_UWB_RST        = -1;
 constexpr uint8_t PIN_UWB_IRQ        = 5;
+constexpr int8_t  PIN_UWB_WAKEUP     = -1;
 
 // ==============================================================================
 // 3. MicroSD — dedicated SPI bus
