@@ -12,7 +12,6 @@ struct TelemetryPacket {
     float    signalRssi;
 };
 
-// One UWB measurement carried in a sync beacon
 struct UWBBeaconEntry {
     uint8_t peerId;
     uint8_t ldeErr;
@@ -21,9 +20,9 @@ struct UWBBeaconEntry {
     float   rssi;
     float   fpPower;
     float   respTemp;
-};  // 22 bytes
+    float   cfoPpm;
+};
 
-// Sync beacon — broadcast by each robot in its own slot
 struct SyncBeaconPacket {
     uint8_t  senderId;
     uint8_t  senderSlot;
@@ -31,21 +30,25 @@ struct SyncBeaconPacket {
     uint32_t senderUptimeMs;
     uint32_t maneuverStartFrame;
 
-    uint8_t       nPeers;          // number of valid UWB entries
-    UWBBeaconEntry peers[2];       // up to 2 peers per robot (3-robot fleet)
+    uint8_t        nPeers;
+    UWBBeaconEntry peers[2];
 
     float    vbat;
+    float    senderTempUwb;
+    float    posX;
+    float    posY;
+    float    headingRad;
 };
 
 struct UWBPollPacket {
-    char     header[4];            // "POLL"
+    char     header[4];
     uint8_t  initiatorId;
     uint8_t  targetId;
     uint32_t sequence;
 };
 
 struct UWBResponsePacket {
-    char     header[4];            // "RESP"
+    char     header[4];
     uint8_t  responderId;
     uint8_t  targetId;
     uint32_t sequence;
